@@ -15,7 +15,7 @@ jobs:
       - name: Descargar el codigo
         uses: actions/checkout@v4
 
-      - name: Configurar Java
+      - name: Configurar Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -33,16 +33,18 @@ jobs:
           pip install --user buildozer cython==0.29.36
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Aceptar Licencias de Android (Modo Manual)
+      - name: Inyectar Licencias de Android
         run: |
-          # Instalamos el SDK manager por fuera para forzar licencias
-          yes | sdkmanager --licenses || true
-          
-      - name: Compilar APK con Buildozer
+          # Creamos manualmente la carpeta de licencias para que Buildozer crea que ya aceptamos todo
+          mkdir -p $HOME/.buildozer/android/platform/android-sdk/licenses
+          echo -e "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451e15b6c51ebe2d95962b9e4d18e\n24333f8a63b6825e3148290753bd0f47cbcc39c8" > $HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > $HOME/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
+
+      - name: Compilar APK
         run: |
           export PATH=$PATH:$HOME/.local/bin
-          # Forzamos a Buildozer a no volver a preguntar
-          buildozer android debug || buildozer android debug
+          # Usamos la opción --allow-root por si acaso y forzamos el modo no interactivo
+          yes | buildozer android debug
         continue-on-error: false
 
       - name: Subir el APK
