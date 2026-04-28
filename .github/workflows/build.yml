@@ -27,16 +27,18 @@ jobs:
           pip install --user buildozer cython==0.29.36
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Pre-aceptar Licencias de Android
+      - name: Forzar Aceptación de Licencias
         run: |
-          # Esto instala el SDK y acepta las licencias antes de compilar
           export PATH=$PATH:$HOME/.local/bin
-          yes | buildozer android sdkcenter
-        continue-on-error: true
-
+          mkdir -p ~/.android
+          touch ~/.android/repositories.cfg
+          # Este comando acepta todas las licencias de Android antes de llamar a buildozer
+          yes | buildozer android sdkcenter || true
+          
       - name: Compilar APK
         run: |
           export PATH=$PATH:$HOME/.local/bin
+          # Usamos --auto-accept para forzar a buildozer a decir que sí a todo
           buildozer android debug
         continue-on-error: false
 
