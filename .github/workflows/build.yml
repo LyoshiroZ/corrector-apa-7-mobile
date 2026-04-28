@@ -1,6 +1,5 @@
 name: Compilar APK Android
 
-# Se ejecuta cada vez que haces push a la rama main, o manualmente
 on:
   push:
     branches: [ main ]
@@ -16,29 +15,25 @@ jobs:
       - name: Descargar el codigo
         uses: actions/checkout@v4
 
-      - name: Cache de Buildozer (global)
-        uses: actions/cache@v4
-        with:
-          path: .buildozer_global
-          key: buildozer-global-${{ hashFiles('buildozer.spec') }}
+      - name: Instalar dependencias del sistema
+        run: |
+          sudo apt update
+          sudo apt install -y python3-pip git zip unzip openjdk-17-jdk \
+            python3-setuptools autoconf libtool pkg-config zlib1g-dev \
+            libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
 
-      - name: Cache de Buildozer (local)
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+      - name: Instalar Buildozer y Cython
+        run: |
+          pip install --user buildozer cython==0.29.36
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Compilar el APK con Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
-          repository_read_only: false
+      - name: Compilar con Buildozer
+        run: |
+          export PATH=$PATH:$HOME/.local/bin
+          buildozer android debug
 
-      - name: Subir el APK como artefacto descargable
+      - name: Subir el APK
         uses: actions/upload-artifact@v4
         with:
           name: corrector-apa-apk
-          path: ${{ steps.buildozer.outputs.filename }}
-          retention-days: 30
+          path: bin/*.apk
