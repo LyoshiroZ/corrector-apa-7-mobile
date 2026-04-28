@@ -15,10 +15,16 @@ jobs:
       - name: Descargar el codigo
         uses: actions/checkout@v4
 
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
       - name: Instalar dependencias del sistema
         run: |
           sudo apt update
-          sudo apt install -y python3-pip git zip unzip openjdk-17-jdk \
+          sudo apt install -y python3-pip git zip unzip \
             python3-setuptools autoconf libtool pkg-config zlib1g-dev \
             libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
 
@@ -27,19 +33,16 @@ jobs:
           pip install --user buildozer cython==0.29.36
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Forzar Aceptación de Licencias
+      - name: Aceptar Licencias de Android (Modo Manual)
         run: |
-          export PATH=$PATH:$HOME/.local/bin
-          mkdir -p ~/.android
-          touch ~/.android/repositories.cfg
-          # Este comando acepta todas las licencias de Android antes de llamar a buildozer
-          yes | buildozer android sdkcenter || true
+          # Instalamos el SDK manager por fuera para forzar licencias
+          yes | sdkmanager --licenses || true
           
-      - name: Compilar APK
+      - name: Compilar APK con Buildozer
         run: |
           export PATH=$PATH:$HOME/.local/bin
-          # Usamos --auto-accept para forzar a buildozer a decir que sí a todo
-          buildozer android debug
+          # Forzamos a Buildozer a no volver a preguntar
+          buildozer android debug || buildozer android debug
         continue-on-error: false
 
       - name: Subir el APK
