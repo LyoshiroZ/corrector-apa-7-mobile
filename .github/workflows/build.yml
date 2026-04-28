@@ -34,6 +34,7 @@ jobs:
         with:
           command: buildozer android debug
           buildozer_version: stable
+          repository_read_only: false
 
       - name: Subir el APK como artefacto descargable
         uses: actions/upload-artifact@v4
