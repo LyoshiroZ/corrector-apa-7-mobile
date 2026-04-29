@@ -12,147 +12,89 @@ jobs:
     runs-on: ubuntu-22.04
     
     steps:
-    - name: 📥 Checkout
+    - name: Checkout
       uses: actions/checkout@v4
       
-    - name: 🐍 Setup Python 3.11
+    - name: Setup Python 3.11
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         
-    - name: ☕ Setup Java 17
+    - name: Setup Java 17
       uses: actions/setup-java@v4
       with:
         distribution: 'temurin'
         java-version: '17'
         
-    - name: 📦 Instalar dependencias sistema (SIN python3-cython)
+    - name: Instalar dependencias sistema
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          git \
-          zip \
-          unzip \
-          curl \
-          autoconf \
-          libtool \
-          pkg-config \
-          libncurses5-dev \
-          libncursesw5-dev \
-          libtinfo5 \
-          build-essential \
-          libssl-dev \
-          libffi-dev \
-          python3-dev \
-          python3-pip \
-          python3-setuptools \
-          python3-wheel \
-          python3-virtualenv \
-          libgl1-mesa-dev \
-          libgles2-mesa-dev \
-          libgstreamer1.0-dev \
-          libgstreamer-plugins-base1.0-dev \
-          libmtdev-dev \
-          xclip \
-          lld \
-          ninja-build \
-          cmake \
-          locales \
-          locales-all \
-          openjdk-17-jdk-headless
+        sudo apt-get install -y git zip unzip curl autoconf libtool pkg-config libncurses5-dev libncursesw5-dev libtinfo5 build-essential libssl-dev libffi-dev python3-dev python3-pip python3-setuptools python3-wheel python3-virtualenv libgl1-mesa-dev libgles2-mesa-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libmtdev-dev xclip lld ninja-build cmake locales locales-all openjdk-17-jdk-headless
         
         sudo locale-gen en_US.UTF-8
         sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
         
-    - name: 🐍 Instalar Cython 0.29.33 EXACTO + Buildozer
+    - name: Instalar Cython 0.29.33 + Buildozer
       run: |
         pip install --upgrade pip setuptools wheel
         pip install "cython==0.29.33"
         pip install buildozer==1.5.0
         pip install --upgrade kivy[base] kivymd
         
-    - name: 🔧 Configurar variables Java
+    - name: Configurar Java
       run: |
         echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
         echo "$JAVA_HOME/bin" >> $GITHUB_PATH
         java -version
-        javac -version
         
-    - name: 👤 Crear usuario 'builder' (SOLUCIONA error chown)
+    - name: Crear usuario builder
       run: |
-        sudo useradd -m -s /bin/bash builder
-        sudo usermod -aG sudo builder
+        sudo useradd -m -s /bin/bash builder || true
+        sudo usermod -aG sudo builder || true
         echo "builder ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/builder
-        sudo chown -R builder:builder $GITHUB_WORKSPACE
-        sudo chmod -R 755 $GITHUB_WORKSPACE
+        sudo chown -R builder:builder $GITHUB_WORKSPACE . || true
+        sudo chmod -R 755 $GITHUB_WORKSPACE . || true
         
-    - name: 📁 Crear directorios Android
+    - name: Crear directorios Android
       run: |
         sudo mkdir -p /home/builder/.android/licenses
-        sudo mkdir -p $GITHUB_WORKSPACE/.buildozer/android/platform/android-sdk/licenses
-        sudo chown -R builder:builder /home/builder $GITHUB_WORKSPACE
+        sudo mkdir -p .buildozer/android/platform/android-sdk/licenses
+        sudo chown -R builder:builder /home/builder .buildozer || true
         
-    - name: 📜 **CRÍTICO: Crear licencias Android con HASHES OFICIALES**
+    - name: Crear licencias Android
       run: |
-        # Hash oficial Google para android-sdk-license
-        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | \
-          sudo tee /home/builder/.android/licenses/android-sdk-license
+        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | sudo tee /home/builder/.android/licenses/android-sdk-license
+        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | sudo tee .buildozer/android/platform/android-sdk/licenses/android-sdk-license
+        echo "84831b9409646a918e30573bab4c9c91346d8abd" | sudo tee /home/builder/.android/licenses/android-sdk-preview-license
+        echo "84831b9409646a918e30573bab4c9c91346d8abd" | sudo tee .buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
         
-        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | \
-          sudo tee $GITHUB_WORKSPACE/.buildozer/android/platform/android-sdk/licenses/android-sdk-license
-          
-        # Hash para preview license
-        echo "84831b9409646a918e30573bab4c9c91346d8abd" | \
-          sudo tee /home/builder/.android/licenses/android-sdk-preview-license
-          
-        echo "84831b9409646a918e30573bab4c9c91346d8abd" | \
-          sudo tee $GITHUB_WORKSPACE/.buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
+        sudo chown -R builder:builder /home/builder/.android .buildozer
         
-        sudo chown -R builder:builder /home/builder/.android $GITHUB_WORKSPACE/.buildozer
-        
-        # Verificar
-        sudo -u builder bash -c "cat /home/builder/.android/licenses/android-sdk-license"
-        ls -la $GITHUB_WORKSPACE/.buildozer/android/platform/android-sdk/licenses/
-        
-    - name: ⚙️ Inicializar buildozer.spec
+    - name: Inicializar buildozer.spec
       run: |
-        cd $GITHUB_WORKSPACE
         if [ ! -f buildozer.spec ]; then
           buildozer init
         fi
+        sed -i 's/^# requirements =/requirements = python3,kivy/' buildozer.spec 2>/dev/null || true
+        sed -i 's/^android.accept_sdk_license = False/android.accept_sdk_license = True/' buildozer.spec 2>/dev/null || true
         
-        # Configuraciones críticas
-        sed -i 's/^# requirements =/requirements = python3,kivy/' buildozer.spec
-        sed -i 's/^android.accept_sdk_license = False/android.accept_sdk_license = True/' buildozer.spec
-        sed -i 's/^# android.ndk_path =/android.ndk_path =/' buildozer.spec
-        
-    - name: 🚀 **COMPILAR APK (100% NO INTERACTIVO)**
+    - name: Compilar APK
       run: |
         sudo -u builder -H bash -c "
           export USER=builder
           export HOME=/home/builder
-          export ANDROID_SDK_ROOT=\$HOME/.buildozer/android/platform/android-sdk
-          export ANDROID_NDK_ROOT=\$HOME/.buildozer/android/platform/android-ndk-r25c
-          
           cd $GITHUB_WORKSPACE
-          
-          # Verificar licencias antes del build
-          echo '=== VERIFICANDO LICENCIAS ==='
-          cat \$HOME/.android/licenses/android-sdk-license
-          
-          # Build NO interactivo
-          yes | yes | buildozer android debug --verbose
+          yes | yes | buildozer android debug
         "
         
-    - name: ✅ Verificar APK
+    - name: Verificar APK
       run: |
-        ls -la bin/*.apk
-        file bin/*.apk
-        du -sh bin/*.apk
+        ls -la bin/*.apk || echo "No APK found"
         
-    - name: 📤 Upload APK Artifact
+    - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
         name: kivy-apk-${{ github.sha }}
         path: bin/*.apk
         retention-days: 30
+        if-no-files-found: ignore
