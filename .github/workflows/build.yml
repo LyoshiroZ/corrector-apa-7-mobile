@@ -27,20 +27,19 @@ jobs:
           openjdk-17-jdk git zip unzip curl autoconf libtool pkg-config \
           libncurses5-dev libncursesw5-dev libtinfo5 build-essential \
           libssl-dev libffi-dev python3-dev python3-pip python3-setuptools \
-          python3-wheel python3-cython python3-virtualenv libgl1-mesa-dev \
+          python3-wheel python3-virtualenv libgl1-mesa-dev \
           libgles2-mesa-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-          libmtdev-dev xclip lld ninja-build cmake wget locales locales-all
-        sudo locale-gen en_US.UTF-8
-        sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+          libmtdev-dev xclip lld ninja-build cmake wget
         
     - name: Configurar Java 17
       run: |
         echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
         echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
         
-    - name: Instalar Buildozer y dependencias
+    - name: Instalar Buildozer y Cython vía PIP
       run: |
-        pip install --upgrade pip setuptools wheel cython virtualenv
+        pip install --upgrade pip setuptools wheel virtualenv
+        pip install cython==0.29.33
         pip install buildozer
         pip install kivy[base] kivymd
         
@@ -58,7 +57,7 @@ jobs:
         sed -i 's/^# requirements =/requirements =/' buildozer.spec
         sed -i 's/^android.accept_sdk_license = False/android.accept_sdk_license = True/' buildozer.spec
         
-    - name: Fix chown error
+    - name: Fix permisos de usuario
       run: |
         sudo useradd -m -s /bin/bash builder
         sudo usermod -aG sudo builder
@@ -74,3 +73,4 @@ jobs:
       with:
         name: apu-apa-apk
         path: bin/*.apk
+    
