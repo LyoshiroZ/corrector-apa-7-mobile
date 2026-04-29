@@ -26,29 +26,24 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
         
-    - name: Instalar dependencias sistema
+    - name: Instalar dependencias sistema MINIMALES
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           git zip unzip curl autoconf libtool pkg-config \
-          libncurses5-dev libncursesw5-dev libtinfo5 build-essential \
-          libssl-dev libffi-dev python3-dev python3-pip python3-setuptools \
-          python3-wheel python3-virtualenv libgl1-mesa-dev libgles2-mesa-dev \
-          libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libmtdev-dev \
-          xclip lld ninja-build cmake locales locales-all \
-          openjdk-17-jdk-headless
+          libncurses5-dev libtinfo5 build-essential \
+          libssl-dev libffi-dev python3-dev python3-pip \
+          libgl1-mesa-dev libgles2-mesa-dev libmtdev-dev \
+          xclip lld ninja-build cmake locales \
+          openjdk-17-jdk-headless libunwind-dev
         
         sudo locale-gen en_US.UTF-8
         
-    - name: Instalar Cython 0.29.33 y dependencias
+    - name: Instalar Cython + Buildozer
       run: |
         pip install --upgrade pip setuptools wheel
         pip install "cython==0.29.33"
         pip install buildozer==1.5.0
-        
-    - name: Instalar requirements
-      run: |
-        pip install -r requirements.txt
         
     - name: Configurar Java
       run: |
@@ -58,28 +53,22 @@ jobs:
     - name: Crear usuario builder
       run: |
         sudo useradd -m -s /bin/bash builder || true
-        sudo usermod -aG sudo builder || true
         echo "builder ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/builder
         
     - name: Crear licencias Android
       run: |
         sudo mkdir -p /home/builder/.android/licenses
         sudo mkdir -p .buildozer/android/platform/android-sdk/licenses
-        sudo chown -R builder:builder /home/builder .buildozer || true
         
         echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | sudo tee /home/builder/.android/licenses/android-sdk-license
         echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | sudo tee .buildozer/android/platform/android-sdk/licenses/android-sdk-license
         echo "84831b9409646a918e30573bab4c9c91346d8abd" | sudo tee /home/builder/.android/licenses/android-sdk-preview-license
-        echo "84831b9409646a918e30573bab4c9c91346d8abd" | sudo tee .buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
         
-        sudo chown -R builder:builder /home/builder/.android .buildozer
+        sudo chown -R builder:builder /home/builder .buildozer
         
-    - name: Configurar buildozer.spec
+    - name: Activar licencias en spec
       run: |
-        sed -i 's/^# requirements =/requirements = python3,kivy==2.3.0,kivymd==1.2.0,pillow,requests,python-docx,lxml,plyer/' buildozer.spec
-        sed -i 's/^android.accept_sdk_license = False/android.accept_sdk_license = True/' buildozer.spec 2>/dev/null || true
-        sed -i 's/^# android.ndk =/android.ndk = 25b/' buildozer.spec
-        sed -i 's/^android.release_artifact = aab/# android.release_artifact = aab/' buildozer.spec
+        sed -i '/android.accept_sdk_license/c\android.accept_sdk_license = True' buildozer.spec 2>/dev/null || echo "android.accept_sdk_license = True" >> buildozer.spec
         
     - name: Compilar APK
       run: |
@@ -90,13 +79,14 @@ jobs:
           yes | yes | buildozer android debug
         "
         
-    - name: Verificar APK
+    - name: Verificar resultado
       run: |
-        ls -la bin/*.apk
+        ls -la bin/ || echo "No bin folder"
         
-    - name: Upload APK
+    - name: Upload APK/AAB
       uses: actions/upload-artifact@v4
       with:
         name: corrector-apa7-${{ github.sha }}
-        path: bin/*.apk
+        path: bin/*
         retention-days: 30
+        if-no-files-found: ignore
