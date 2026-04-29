@@ -1,4 +1,4 @@
-name: Build Corrector APA 7 APK
+name: Build Corrector APA 7 - FINAL
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
       
-    - name: Setup Python 3.11
+    - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
@@ -26,67 +26,53 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
         
-    - name: Instalar dependencias sistema MINIMALES
+    - name: Instalar dependencias
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           git zip unzip curl autoconf libtool pkg-config \
-          libncurses5-dev libtinfo5 build-essential \
-          libssl-dev libffi-dev python3-dev python3-pip \
-          libgl1-mesa-dev libgles2-mesa-dev libmtdev-dev \
-          xclip lld ninja-build cmake locales \
+          libncurses5-dev libtinfo5 build-essential libssl-dev \
+          libffi-dev python3-dev libgl1-mesa-dev libgles2-mesa-dev \
+          libmtdev-dev xclip lld ninja-build cmake \
           openjdk-17-jdk-headless libunwind-dev
         
-        sudo locale-gen en_US.UTF-8
-        
-    - name: Instalar Cython + Buildozer
+    - name: Instalar Python tools
       run: |
-        pip install --upgrade pip setuptools wheel
-        pip install "cython==0.29.33"
-        pip install buildozer==1.5.0
+        python3 -m pip install --upgrade pip setuptools wheel
+        python3 -m pip install "cython==0.29.33"
+        python3 -m pip install buildozer==1.5.0
         
-    - name: Configurar Java
+    - name: Configurar entorno
       run: |
         echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
         echo "$JAVA_HOME/bin" >> $GITHUB_PATH
         
-    - name: Crear usuario builder
+    - name: Licencias Android
       run: |
-        sudo useradd -m -s /bin/bash builder || true
-        echo "builder ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/builder
+        mkdir -p ~/.android/licenses
+        mkdir -p .buildozer/android/platform/android-sdk/licenses
         
-    - name: Crear licencias Android
-      run: |
-        sudo mkdir -p /home/builder/.android/licenses
-        sudo mkdir -p .buildozer/android/platform/android-sdk/licenses
+        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > ~/.android/licenses/android-sdk-license
+        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > .buildozer/android/platform/android-sdk/licenses/android-sdk-license
+        echo "84831b9409646a918e30573bab4c9c91346d8abd" > ~/.android/licenses/android-sdk-preview-license
         
-        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | sudo tee /home/builder/.android/licenses/android-sdk-license
-        echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | sudo tee .buildozer/android/platform/android-sdk/licenses/android-sdk-license
-        echo "84831b9409646a918e30573bab4c9c91346d8abd" | sudo tee /home/builder/.android/licenses/android-sdk-preview-license
-        
-        sudo chown -R builder:builder /home/builder .buildozer
-        
-    - name: Activar licencias en spec
+    - name: Configurar buildozer.spec
       run: |
         sed -i '/android.accept_sdk_license/c\android.accept_sdk_license = True' buildozer.spec 2>/dev/null || echo "android.accept_sdk_license = True" >> buildozer.spec
         
-    - name: Compilar APK
+    - name: Build APK - SIN sudo
       run: |
-        sudo -u builder -H bash -c "
-          export USER=builder
-          export HOME=/home/builder
-          cd $GITHUB_WORKSPACE
-          yes | yes | buildozer android debug
-        "
+        export ANDROID_SDK_ROOT=$HOME/.buildozer/android/platform/android-sdk
+        export ANDROID_NDK_ROOT=$HOME/.buildozer/android/platform/android-ndk-r25b
+        yes | buildozer android debug
         
-    - name: Verificar resultado
+    - name: Verificar APK
       run: |
-        ls -la bin/ || echo "No bin folder"
+        ls -la bin/
         
-    - name: Upload APK/AAB
+    - name: Upload
       uses: actions/upload-artifact@v4
       with:
         name: corrector-apa7-${{ github.sha }}
         path: bin/*
         retention-days: 30
-        if-no-files-found: ignore
