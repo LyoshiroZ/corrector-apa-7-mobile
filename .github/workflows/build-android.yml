@@ -1,0 +1,60 @@
+name: Compilar APK Android
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Build APK (Docker Kivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache buildozer
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-docker-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-docker-
+
+      # Crear la carpeta bin/ en el host antes de montar en Docker
+      # para que el contenedor pueda escribir sin problemas de permisos
+      - name: Preparar carpetas
+        run: |
+          mkdir -p bin
+          mkdir -p .buildozer
+          chmod 777 bin .buildozer
+
+      - name: Compilar APK con Docker Kivy
+        run: |
+          docker run --rm \
+            --volume "$(pwd)":/home/user/hostcwd \
+            --user "$(id -u):$(id -g)" \
+            kivy/buildozer:latest \
+            android debug
+          echo "=== Resultado de la compilacion ==="
+          find "$(pwd)" -name "*.apk" -o -name "*.aab" 2>/dev/null || true
+          ls -la bin/ || echo "bin/ vacia o no existe"
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: corrector-apa-7-apk
+          path: bin/*.apk
+          if-no-files-found: error
+
+      - name: Subir log si hay error
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-error
+          path: |
+            .buildozer/android/platform/build-*/dists/**/*.log
+            *.log
+          retention-days: 7
