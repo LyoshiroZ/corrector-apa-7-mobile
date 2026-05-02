@@ -20,7 +20,7 @@ android.permissions = INTERNET, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE
 
 android.api = 33
 android.minapi = 21
-android.ndk = 26b
+android.ndk = 25b
 android.ndk_api = 21
 # Fijamos build-tools 34 para evitar el problema de licencia de build-tools 37
 android.build_tools_version = 34.0.0
