@@ -8,11 +8,11 @@ source.include_exts = py,png,jpg,kv,atlas,ttf,json
 source.include_patterns = assets/*
 source.exclude_dirs = tests, bin, .buildozer, __pycache__, .github
 
-version = 1.0.1
+version = 1.0.2
 
 # Dependencias Python (recipes de python-for-android).
 # lxml 5.2.2 es compatible con Python 3.11 (la <=4.9 da error 'incomplete struct _frame').
-requirements = python3,kivy==2.3.0,kivymd==1.2.0,pillow,requests,python-docx,lxml==5.2.2,plyer,android,pyjnius
+requirements = python3,kivy==2.3.0,kivymd==1.2.0,pillow,requests,python-docx,lxml==5.2.2,typing_extensions,plyer,android,pyjnius
 
 orientation = portrait
 fullscreen = 0
