@@ -8,7 +8,7 @@ source.include_exts = py,png,jpg,kv,atlas,ttf,json
 source.include_patterns = assets/*
 source.exclude_dirs = tests, bin, .buildozer, __pycache__, .github
 
-version = 1.0.0
+version = 1.0.1
 
 # Dependencias Python (recipes de python-for-android).
 # lxml 5.2.2 es compatible con Python 3.11 (la <=4.9 da error 'incomplete struct _frame').
