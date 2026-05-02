@@ -35,61 +35,66 @@ jobs:
             autoconf libtool pkg-config zlib1g-dev \
             libncurses-dev libtinfo6 cmake \
             libgl1-mesa-dev libgles2-mesa-dev libmtdev-dev \
-            xclip lld ninja-build libunwind-dev wget
+            xclip lld ninja-build libunwind-dev wget ca-certificates-java
+          sudo update-ca-certificates -f || true
 
       - name: Instalar buildozer y cython
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install --upgrade "cython==0.29.36" "buildozer>=1.5.0" virtualenv
 
-      # Cache nuevo (key v7 para invalidar el cache corrupto anterior)
+      # Cache nuevo (key v8 para invalidar caches corruptos anteriores)
       - name: Cache buildozer
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v7-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v8-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v7-
+            buildozer-v8-
 
-      # Pre-instalar cmdline-tools (sdkmanager) en la ruta donde buildozer lo busca
-      - name: Pre-instalar Android cmdline-tools y SDK base
+      # Pre-instalar el SDK completo con cmdline-tools en TODAS las rutas que buildozer puede buscar
+      - name: Pre-instalar Android SDK
         run: |
           export ANDROID_HOME=$HOME/.buildozer/android/platform/android-sdk
-          mkdir -p $ANDROID_HOME/cmdline-tools
-          cd $ANDROID_HOME/cmdline-tools
+          mkdir -p $ANDROID_HOME
 
-          # Descargar cmdline-tools si no existen
-          if [ ! -d "latest" ]; then
+          # 1) Descargar e instalar cmdline-tools en su ruta moderna
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest/bin" ]; then
             echo "Descargando Android cmdline-tools..."
+            mkdir -p $ANDROID_HOME/cmdline-tools
+            cd $ANDROID_HOME/cmdline-tools
             wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
             unzip -q cmdline-tools.zip
             mv cmdline-tools latest
             rm cmdline-tools.zip
           fi
 
-          # Crear symlink legacy para versiones viejas de buildozer que buscan tools/bin/sdkmanager
-          mkdir -p $ANDROID_HOME/tools
-          ln -sfn $ANDROID_HOME/cmdline-tools/latest/bin $ANDROID_HOME/tools/bin
+          # 2) COPIAR (no symlink) el contenido completo a tools/ para la ruta legacy
+          # Esto resuelve el ClassNotFoundException porque la estructura bin/ + lib/ queda intacta
+          if [ ! -f "$ANDROID_HOME/tools/bin/sdkmanager" ]; then
+            mkdir -p $ANDROID_HOME/tools
+            cp -r $ANDROID_HOME/cmdline-tools/latest/* $ANDROID_HOME/tools/
+          fi
 
-          # Pre-aceptar todas las licencias
+          # 3) Pre-aceptar todas las licencias
           mkdir -p $ANDROID_HOME/licenses
           printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" > $ANDROID_HOME/licenses/android-sdk-license
           printf "84831b9409646a918e30573bab4c9c91346d8abd\n" > $ANDROID_HOME/licenses/android-sdk-preview-license
           printf "33b6937e7c023ef4a5e14a0c39b7c77c81a700f7\n" > $ANDROID_HOME/licenses/google-gdk-license
           printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" > $ANDROID_HOME/licenses/intel-android-extra-license
 
-          # Aceptar licencias usando sdkmanager (por si acaso)
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          # 4) Aceptar licencias adicionales con sdkmanager
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME --licenses > /dev/null 2>&1 || true
 
-          # Instalar componentes base del SDK
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          # 5) Instalar componentes base del SDK (sin esto, buildozer fallaria al instalarlos)
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --sdk_root=$ANDROID_HOME \
             "platform-tools" \
             "build-tools;34.0.0" \
-            "platforms;android-33" || true
+            "platforms;android-33"
 
-          echo "=== SDK instalado ==="
+          echo "=== SDK preparado ==="
           ls $ANDROID_HOME/
 
       - name: Compilar APK
