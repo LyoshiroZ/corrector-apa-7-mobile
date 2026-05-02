@@ -15,35 +15,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache buildozer
+      # Cacheamos el HOME del contenedor (donde Docker guarda SDK, NDK y licencias)
+      - name: Cache buildozer home del contenedor
         uses: actions/cache@v4
         with:
-          path: .buildozer
-          key: buildozer-docker-${{ hashFiles('buildozer.spec') }}
+          path: ~/.buildozer_cache
+          key: buildozer-home-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-docker-
+            buildozer-home-
 
-      # Pre-aceptar todas las licencias del Android SDK
-      # Los hashes son los hashes oficiales de Google para cada licencia
+      # Escribimos las licencias en la carpeta que el contenedor realmente usa
       - name: Aceptar licencias Android SDK
         run: |
           mkdir -p bin
-          mkdir -p .buildozer/android/platform/android-sdk/licenses
-          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" \
-            > .buildozer/android/platform/android-sdk/licenses/android-sdk-license
+          mkdir -p ~/.buildozer_cache/android/platform/android-sdk/licenses
+          # Hashes oficiales de Google para android-sdk-license
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
+            > ~/.buildozer_cache/android/platform/android-sdk/licenses/android-sdk-license
           printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
-            > .buildozer/android/platform/android-sdk/licenses/android-sdk-preview-license
+            > ~/.buildozer_cache/android/platform/android-sdk/licenses/android-sdk-preview-license
           printf "33b6937e7c023ef4a5e14a0c39b7c77c81a700f7\n" \
-            > .buildozer/android/platform/android-sdk/licenses/google-gdk-license
-          printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" \
-            > .buildozer/android/platform/android-sdk/licenses/intel-android-extra-license
-          echo "Licencias escritas:"
-          ls -la .buildozer/android/platform/android-sdk/licenses/
+            > ~/.buildozer_cache/android/platform/android-sdk/licenses/google-gdk-license
+          echo "Licencias escritas en: ~/.buildozer_cache/android/platform/android-sdk/licenses/"
+          ls ~/.buildozer_cache/android/platform/android-sdk/licenses/
 
       - name: Compilar APK con Docker Kivy
         run: |
           docker run --rm \
             --volume "$(pwd)":/home/user/hostcwd \
+            --volume "$HOME/.buildozer_cache":/home/user/.buildozer \
             kivy/buildozer:latest \
             android debug
           echo "=== Archivos en bin/ ==="
