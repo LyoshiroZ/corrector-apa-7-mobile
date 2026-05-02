@@ -23,24 +23,17 @@ jobs:
           restore-keys: |
             buildozer-docker-
 
-      # Crear la carpeta bin/ en el host antes de montar en Docker
-      # para que el contenedor pueda escribir sin problemas de permisos
-      - name: Preparar carpetas
-        run: |
-          mkdir -p bin
-          mkdir -p .buildozer
-          chmod 777 bin .buildozer
+      - name: Preparar carpeta bin
+        run: mkdir -p bin
 
       - name: Compilar APK con Docker Kivy
         run: |
           docker run --rm \
             --volume "$(pwd)":/home/user/hostcwd \
-            --user "$(id -u):$(id -g)" \
             kivy/buildozer:latest \
             android debug
-          echo "=== Resultado de la compilacion ==="
-          find "$(pwd)" -name "*.apk" -o -name "*.aab" 2>/dev/null || true
-          ls -la bin/ || echo "bin/ vacia o no existe"
+          echo "=== Archivos generados ==="
+          find "$(pwd)/bin" -type f 2>/dev/null || echo "bin/ vacia"
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
@@ -54,7 +47,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-error
-          path: |
-            .buildozer/android/platform/build-*/dists/**/*.log
-            *.log
+          path: "*.log"
           retention-days: 7
