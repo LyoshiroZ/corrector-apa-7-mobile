@@ -35,7 +35,10 @@ jobs:
             autoconf libtool pkg-config zlib1g-dev \
             libncurses-dev libtinfo6 cmake \
             libgl1-mesa-dev libgles2-mesa-dev libmtdev-dev \
-            xclip lld ninja-build libunwind-dev wget ca-certificates-java
+            xclip lld ninja-build libunwind-dev wget ca-certificates-java \
+            liblzma-dev libbz2-dev libsqlite3-dev libreadline-dev \
+            libgdbm-dev uuid-dev tk-dev libxml2-dev libxslt1-dev \
+            xz-utils
           sudo update-ca-certificates -f || true
 
       - name: Instalar buildozer y cython
@@ -43,16 +46,16 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install --upgrade "cython==0.29.36" "buildozer>=1.5.0" virtualenv
 
-      # Cache nuevo (key v8 para invalidar caches corruptos anteriores)
+      # Cache v9: invalida v8 (Python a medio compilar por faltar liblzma-dev)
       - name: Cache buildozer
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v8-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v9-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-v8-
+            buildozer-v9-
 
       # Pre-instalar el SDK completo con cmdline-tools en TODAS las rutas que buildozer puede buscar
       - name: Pre-instalar Android SDK
