@@ -7,47 +7,71 @@ on:
 
 jobs:
   build-apk:
-    name: Build APK (Docker Kivy)
-    runs-on: ubuntu-latest
+    name: Build APK
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Cacheamos el HOME del contenedor (donde Docker guarda SDK, NDK y licencias)
-      - name: Cache buildozer home del contenedor
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Instalar dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache git zip unzip openjdk-17-jdk \
+            python3-dev libffi-dev libssl-dev \
+            autoconf libtool pkg-config zlib1g-dev \
+            libncurses-dev libtinfo6 cmake \
+            libgl1-mesa-dev libgles2-mesa-dev libmtdev-dev \
+            xclip lld ninja-build libunwind-dev
+
+      - name: Instalar buildozer y cython
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --upgrade "cython==0.29.36" "buildozer>=1.5.0" virtualenv
+
+      - name: Cache buildozer
         uses: actions/cache@v4
         with:
-          path: ~/.buildozer_cache
-          key: buildozer-home-${{ hashFiles('buildozer.spec') }}
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-home-
+            buildozer-
 
-      # Escribimos las licencias en la carpeta que el contenedor realmente usa
-      - name: Aceptar licencias Android SDK
+      - name: Pre-aceptar licencias Android SDK
         run: |
-          mkdir -p bin
-          mkdir -p ~/.buildozer_cache/android/platform/android-sdk/licenses
-          # Hashes oficiales de Google para android-sdk-license
-          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" \
-            > ~/.buildozer_cache/android/platform/android-sdk/licenses/android-sdk-license
-          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
-            > ~/.buildozer_cache/android/platform/android-sdk/licenses/android-sdk-preview-license
-          printf "33b6937e7c023ef4a5e14a0c39b7c77c81a700f7\n" \
-            > ~/.buildozer_cache/android/platform/android-sdk/licenses/google-gdk-license
-          echo "Licencias escritas en: ~/.buildozer_cache/android/platform/android-sdk/licenses/"
-          ls ~/.buildozer_cache/android/platform/android-sdk/licenses/
+          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
+          mkdir -p ~/.android/licenses
+          for dir in ~/.buildozer/android/platform/android-sdk/licenses ~/.android/licenses; do
+            printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" > "$dir/android-sdk-license"
+            printf "84831b9409646a918e30573bab4c9c91346d8abd\n" > "$dir/android-sdk-preview-license"
+            printf "33b6937e7c023ef4a5e14a0c39b7c77c81a700f7\n" > "$dir/google-gdk-license"
+            printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" > "$dir/intel-android-extra-license"
+          done
+          echo "Licencias pre-aceptadas."
 
-      - name: Compilar APK con Docker Kivy
+      - name: Compilar APK
         run: |
-          docker run --rm \
-            --volume "$(pwd)":/home/user/hostcwd \
-            --volume "$HOME/.buildozer_cache":/home/user/.buildozer \
-            kivy/buildozer:latest \
-            android debug
-          echo "=== Archivos en bin/ ==="
-          find "$(pwd)/bin" -type f 2>/dev/null || echo "bin/ vacia"
+          buildozer -v android debug
+
+      - name: Listar APK generado
+        run: |
+          echo "=== Contenido de bin/ ==="
+          ls -la bin/ || echo "bin/ vacia"
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
@@ -61,5 +85,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-error
-          path: "*.log"
+          path: |
+            .buildozer/**/*.log
+            *.log
           retention-days: 7
