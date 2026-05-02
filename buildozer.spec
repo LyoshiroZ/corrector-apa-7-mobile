@@ -6,38 +6,34 @@ package.domain = com.correctorapa
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,ttf,json
 source.include_patterns = assets/*
-source.exclude_dirs = tests, bin, .buildozer, __pycache__
+source.exclude_dirs = tests, bin, .buildozer, __pycache__, .github
 
 version = 1.0.0
 
 # Dependencias Python (recipes de python-for-android).
-# python-docx requiere lxml; google-genai NO se incluye porque la app móvil
-# llama a Gemini directamente por REST con `requests`.
-requirements = python3,kivy==2.3.0,kivymd==1.2.0,pillow,requests,python-docx,lxml,plyer
+# android y pyjnius son necesarios para que plyer funcione en Android.
+# python-docx requiere lxml; google-genai NO se incluye porque la app
+# llama a Gemini directamente por REST con requests.
+requirements = python3,kivy==2.3.0,kivymd==1.2.0,pillow,requests,python-docx,lxml,plyer,android,pyjnius
 
 orientation = portrait
 fullscreen = 0
 
-# Permisos Android
 android.permissions = INTERNET, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE
 
-# Targets de Android: API 33 (Play Store), mínimo 21 (Android 5.0)
 android.api = 33
 android.minapi = 21
 android.ndk = 26b
-android.archs = android.archs = arm64-v8a
-
-# Para subir a Google Play se necesita un AAB firmado.
-# Comenta la siguiente línea si solo quieres un APK de prueba.
-android.release_artifact = aab
+android.ndk_api = 21
+android.archs = arm64-v8a
 
 android.allow_backup = True
 
-# Icono y splash (deja los predeterminados o coloca tus PNG en assets/)
-# icon.filename = %(source.dir)s/assets/icon.png
-# presplash.filename = %(source.dir)s/assets/presplash.png
+# Nota: android.release_artifact solo aplica a builds de RELEASE.
+# El workflow de CI usa "buildozer android debug" que siempre produce un APK.
+# Cuando quieras subir a Play Store, ejecuta "buildozer android release" localmente.
+android.release_artifact = aab
 
-# Logging
 log_level = 2
 warn_on_root = 1
 
