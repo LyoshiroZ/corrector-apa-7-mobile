@@ -35,43 +35,75 @@ jobs:
             autoconf libtool pkg-config zlib1g-dev \
             libncurses-dev libtinfo6 cmake \
             libgl1-mesa-dev libgles2-mesa-dev libmtdev-dev \
-            xclip lld ninja-build libunwind-dev
+            xclip lld ninja-build libunwind-dev wget
 
       - name: Instalar buildozer y cython
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install --upgrade "cython==0.29.36" "buildozer>=1.5.0" virtualenv
 
+      # Cache nuevo (key v7 para invalidar el cache corrupto anterior)
       - name: Cache buildozer
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v7-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-
+            buildozer-v7-
 
-      - name: Pre-aceptar licencias Android SDK
+      # Pre-instalar cmdline-tools (sdkmanager) en la ruta donde buildozer lo busca
+      - name: Pre-instalar Android cmdline-tools y SDK base
         run: |
-          mkdir -p ~/.buildozer/android/platform/android-sdk/licenses
-          mkdir -p ~/.android/licenses
-          for dir in ~/.buildozer/android/platform/android-sdk/licenses ~/.android/licenses; do
-            printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" > "$dir/android-sdk-license"
-            printf "84831b9409646a918e30573bab4c9c91346d8abd\n" > "$dir/android-sdk-preview-license"
-            printf "33b6937e7c023ef4a5e14a0c39b7c77c81a700f7\n" > "$dir/google-gdk-license"
-            printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" > "$dir/intel-android-extra-license"
-          done
-          echo "Licencias pre-aceptadas."
+          export ANDROID_HOME=$HOME/.buildozer/android/platform/android-sdk
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          cd $ANDROID_HOME/cmdline-tools
+
+          # Descargar cmdline-tools si no existen
+          if [ ! -d "latest" ]; then
+            echo "Descargando Android cmdline-tools..."
+            wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdline-tools.zip
+            unzip -q cmdline-tools.zip
+            mv cmdline-tools latest
+            rm cmdline-tools.zip
+          fi
+
+          # Crear symlink legacy para versiones viejas de buildozer que buscan tools/bin/sdkmanager
+          mkdir -p $ANDROID_HOME/tools
+          ln -sfn $ANDROID_HOME/cmdline-tools/latest/bin $ANDROID_HOME/tools/bin
+
+          # Pre-aceptar todas las licencias
+          mkdir -p $ANDROID_HOME/licenses
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n8933bad161af4178b1185d1a37fbf41ea5269c55\n" > $ANDROID_HOME/licenses/android-sdk-license
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" > $ANDROID_HOME/licenses/android-sdk-preview-license
+          printf "33b6937e7c023ef4a5e14a0c39b7c77c81a700f7\n" > $ANDROID_HOME/licenses/google-gdk-license
+          printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" > $ANDROID_HOME/licenses/intel-android-extra-license
+
+          # Aceptar licencias usando sdkmanager (por si acaso)
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+          # Instalar componentes base del SDK
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "build-tools;34.0.0" \
+            "platforms;android-33" || true
+
+          echo "=== SDK instalado ==="
+          ls $ANDROID_HOME/
 
       - name: Compilar APK
+        env:
+          ANDROIDSDK: /home/runner/.buildozer/android/platform/android-sdk
+          ANDROID_HOME: /home/runner/.buildozer/android/platform/android-sdk
         run: |
           buildozer -v android debug
 
       - name: Listar APK generado
+        if: always()
         run: |
           echo "=== Contenido de bin/ ==="
-          ls -la bin/ || echo "bin/ vacia"
+          ls -la bin/ 2>/dev/null || echo "bin/ vacia"
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
