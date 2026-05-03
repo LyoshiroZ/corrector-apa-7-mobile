@@ -1,0 +1,2036 @@
+"""Corrector APA 7 - aplicación móvil (Kivy + KivyMD).
+
+Versión móvil de la app Streamlit, lista para empaquetar como APK/AAB con
+buildozer. Conserva el prompt, parser, métricas, generador de Word y la
+opción de keep_with_next para los títulos.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import sys
+import threading
+import traceback
+import difflib
+from collections import Counter
+from pathlib import Path
+
+
+# --- Capturador de errores de emergencia (para diagnostico en Android) -------
+# v13: ahora ademas escribimos un "rastro" del arranque (boot trace) para saber
+# cuanto progreso de la app ocurre antes del crash. Tambien agregamos timestamp
+# y version para distinguir logs viejos de nuevos.
+APP_VERSION = "1.0.3"
+
+
+def _carpeta_logs() -> str:
+    """Devuelve carpeta donde escribir logs (Downloads en Android, home en PC)."""
+    try:
+        from kivy.utils import platform as _plt
+        if _plt == "android":
+            from android.storage import primary_external_storage_path
+            return os.path.join(primary_external_storage_path(), "Download")
+    except Exception:
+        pass
+    return os.path.expanduser("~")
+
+
+def _escribir_archivo(nombre: str, contenido: str):
+    """Escribe un archivo en la carpeta de logs. Silencioso si falla."""
+    try:
+        ruta = os.path.join(_carpeta_logs(), nombre)
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+        with open(ruta, "w", encoding="utf-8") as f:
+            f.write(contenido)
+    except Exception:
+        pass
+
+
+def _ahora() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _marca_arranque(etapa: str, extra: str = ""):
+    """Escribe un archivo con la etapa actual del arranque."""
+    txt = f"APU-APA v{APP_VERSION}\nEtapa: {etapa}\nHora: {_ahora()}\n"
+    if extra:
+        txt += f"\nDetalle:\n{extra}\n"
+    _escribir_archivo(f"apa_boot_{etapa}.log", txt)
+
+
+# Marca 1: Python arrancó y llegamos al inicio de main.py
+_marca_arranque("1_python_iniciado")
+
+
+def _escribir_crash(exc_type, exc_value, exc_tb):
+    txt = (
+        f"=== APA Crash Log ===\n"
+        f"Version APP: {APP_VERSION}\n"
+        f"Hora: {_ahora()}\n"
+        f"Error: {exc_type.__name__}: {exc_value}\n\n"
+    )
+    try:
+        buf = io.StringIO()
+        traceback.print_exception(exc_type, exc_value, exc_tb, file=buf)
+        txt += buf.getvalue()
+    except Exception:
+        pass
+    _escribir_archivo("apa_crash.log", txt)
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    _escribir_crash(exc_type, exc_value, exc_tb)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+sys.excepthook = _excepthook
+
+from kivy.animation import Animation
+from kivy.clock import Clock, mainthread
+from kivy.core.window import Window
+from kivy.metrics import dp
+from kivy.utils import platform
+
+from kivy.uix.image import Image as KivyImage
+
+from kivymd.app import MDApp
+from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.button import MDFlatButton, MDRaisedButton
+from kivymd.uix.card import MDCard
+from kivymd.uix.dialog import MDDialog
+from kivymd.uix.floatlayout import MDFloatLayout
+from kivymd.uix.label import MDIcon, MDLabel
+from kivymd.uix.menu import MDDropdownMenu
+from kivymd.uix.progressbar import MDProgressBar
+from kivymd.uix.scrollview import MDScrollView
+from kivymd.uix.screenmanager import MDScreenManager
+from kivymd.uix.screen import MDScreen
+from kivymd.uix.selectioncontrol import MDSwitch
+from kivymd.uix.snackbar import Snackbar
+from kivymd.uix.tab import MDTabs, MDTabsBase
+from kivymd.uix.textfield import MDTextField
+from kivymd.uix.toolbar import MDTopAppBar
+
+import requests
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+
+# Plantillas APA prediseñadas (mismo módulo que usa la web)
+from plantillas import PLANTILLAS_APA, construir_plantilla_apa
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt, RGBColor
+
+
+# Marca 2: Todos los imports terminaron sin errores
+_marca_arranque("2_imports_ok")
+
+
+GEMINI_MODELOS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+GEMINI_DEFAULT = "gemini-2.0-flash"
+GEMINI_REST = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{modelo}:generateContent?key={key}"
+)
+
+PROMPT = """Eres un especialista en normas APA 7ma edición y redacción académica en español.
+
+Tu tarea: corregir el siguiente texto académico ({tipo_doc}) al formato APA 7ma edición.
+
+Debes:
+1. Corregir todas las CITAS dentro del texto al formato APA 7 (parentéticas y narrativas, citas directas cortas y largas, citas de paráfrasis).
+2. Generar/corregir la lista de REFERENCIAS al final, ordenada alfabéticamente, con sangría francesa implícita y formato APA 7 correcto.
+3. Mejorar de forma mínima la redacción solo cuando sea necesario para la coherencia, sin cambiar el contenido ni el significado.
+4. Conservar el idioma original (español).
+5. Si faltan datos en alguna referencia (ej. año, editorial), márcalo entre corchetes así: [falta año].
+6. Estructurar el documento con jerarquías de títulos APA 7. Identifica títulos y subtítulos en el texto (o agrégalos si el documento claramente los necesita) y márcalos al INICIO de su línea con uno de estos prefijos exactos:
+   - `[H1] ` para títulos de Nivel 1 (secciones principales: Introducción, Método, Resultados, Discusión, Conclusiones, etc.)
+   - `[H2] ` para títulos de Nivel 2 (subsecciones)
+   - `[H3] ` para títulos de Nivel 3 (sub-subsecciones)
+   No uses estos marcadores en líneas que no sean títulos. No los uses en el cuerpo ni en las referencias.
+
+FORMATO DE SALIDA OBLIGATORIO (en texto plano, sin markdown, sin ```):
+
+TÍTULO: <un título sugerido para el documento>
+
+CUERPO:
+<el texto corregido completo, con las citas en formato APA correcto>
+
+REFERENCIAS:
+<lista de referencias en formato APA 7, una por línea, ordenadas alfabéticamente>
+
+{notas_section}
+
+Texto a corregir:
+---
+{texto}
+---
+"""
+
+_STOPWORDS = {
+    "de", "la", "que", "el", "en", "y", "a", "los", "del", "se", "las", "por",
+    "un", "para", "con", "no", "una", "su", "al", "lo", "como", "más", "pero",
+    "sus", "le", "ya", "o", "este", "sí", "porque", "esta", "entre", "cuando",
+    "muy", "sin", "sobre", "también", "me", "hasta", "hay", "donde", "quien",
+    "desde", "todo", "nos", "durante", "todos", "uno", "les", "ni", "contra",
+    "otros", "ese", "eso", "ante", "ellos", "e", "esto", "mí", "antes",
+    "algunos", "qué", "unos", "yo", "otro", "otras", "otra", "él", "tanto",
+    "esa", "estos", "mucho", "quienes", "nada", "muchos", "cual", "poco",
+    "ella", "estar", "estas", "algunas", "algo", "nosotros", "mi", "mis", "tú",
+    "te", "ti", "tu", "tus", "ellas", "es", "son", "fue", "ser", "ha", "han",
+    "the", "of", "and", "to", "in", "is", "it", "that", "for", "on", "with",
+}
+
+
+# ---------------------------- Helpers de IA ----------------------------------
+
+
+def llamar_gemini_rest(api_key: str, texto: str, tipo_doc: str, modelo: str,
+                       con_notas: bool, timeout: int = 90) -> str:
+    """Llama a Gemini por REST con reintentos y manejo de timeouts."""
+    if not api_key:
+        raise RuntimeError(
+            "La app no se compiló con clave de Gemini. "
+            "Avisa al desarrollador (falta el secret en GitHub)."
+        )
+    notas_section = (
+        "NOTAS DE CAMBIOS:\n<lista breve de los principales cambios "
+        "realizados (máx. 8 puntos)>"
+    ) if con_notas else ""
+    prompt = PROMPT.format(
+        tipo_doc=tipo_doc, notas_section=notas_section, texto=texto,
+    )
+    url = GEMINI_REST.format(modelo=modelo, key=api_key)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+    last_err: Exception | None = None
+    for intento in range(3):
+        try:
+            r = requests.post(url, json=payload, timeout=timeout)
+            if r.status_code >= 400:
+                raise RuntimeError(
+                    f"La API respondió con código {r.status_code}. "
+                    "Verifica tu API key y conexión."
+                )
+            data = r.json()
+            return (
+                data["candidates"][0]["content"]["parts"][0]["text"] or ""
+            ).strip()
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = e
+            continue
+    raise RuntimeError(
+        "No se pudo conectar con Gemini tras 3 intentos. "
+        "Revisa tu conexión móvil e inténtalo de nuevo."
+    )
+
+
+def parsear_secciones(salida: str) -> dict:
+    secciones = {"titulo": "", "cuerpo": "", "referencias": "", "notas": ""}
+    actual: str | None = None
+    buffer: list[str] = []
+
+    def flush():
+        if actual and buffer:
+            secciones[actual] = "\n".join(buffer).strip()
+
+    for linea in salida.splitlines():
+        stripped = linea.strip()
+        upper = stripped.upper()
+        if upper.startswith("TÍTULO:") or upper.startswith("TITULO:"):
+            flush(); buffer = []; actual = "titulo"
+            valor = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if valor:
+                buffer.append(valor)
+        elif upper.startswith("CUERPO:"):
+            flush(); buffer = []; actual = "cuerpo"
+        elif upper.startswith("REFERENCIAS:"):
+            flush(); buffer = []; actual = "referencias"
+        elif upper.startswith("NOTAS DE CAMBIOS:") or upper.startswith("NOTAS:"):
+            flush(); buffer = []; actual = "notas"
+        else:
+            if actual:
+                buffer.append(linea)
+    flush()
+    return secciones
+
+
+# ---------------------------- Métricas ---------------------------------------
+
+
+def contar_citas(texto: str) -> int:
+    if not texto:
+        return 0
+    parenteticas = re.findall(
+        r"\([^()]*\b\d{4}[a-z]?\b[^()]*\)", texto,
+    )
+    narrativas = re.findall(
+        r"\b[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-]+(?:\s+(?:y|and|&)\s+"
+        r"[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ\-]+)?\s*\(\d{4}[a-z]?\)",
+        texto,
+    )
+    return len(parenteticas) + len(narrativas)
+
+
+def contar_referencias(texto: str) -> int:
+    if not texto:
+        return 0
+    return sum(1 for l in texto.splitlines() if l.strip())
+
+
+def contar_cambios_palabras(original: str, corregido: str) -> dict:
+    po = (original or "").split()
+    pc = (corregido or "").split()
+    matcher = difflib.SequenceMatcher(a=po, b=pc, autojunk=False)
+    eliminadas = anadidas = modificadas = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "delete":
+            eliminadas += i2 - i1
+        elif tag == "insert":
+            anadidas += j2 - j1
+        elif tag == "replace":
+            modificadas += max(i2 - i1, j2 - j1)
+    return {
+        "modificadas": modificadas, "anadidas": anadidas,
+        "eliminadas": eliminadas,
+        "total": modificadas + anadidas + eliminadas,
+        "palabras_original": len(po), "palabras_corregido": len(pc),
+    }
+
+
+def _silabas_es(palabra: str) -> int:
+    palabra = re.sub(r"[^a-záéíóúüñ]", "", palabra.lower())
+    if not palabra:
+        return 0
+    vocales = "aeiouáéíóúü"
+    s = 0
+    prev = False
+    for ch in palabra:
+        v = ch in vocales
+        if v and not prev:
+            s += 1
+        prev = v
+    return max(s, 1)
+
+
+def analizar_legibilidad(texto: str) -> dict:
+    texto = texto or ""
+    oraciones = [o.strip() for o in re.split(r"[.!?]+", texto) if o.strip()]
+    palabras = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", texto)
+    no = max(len(oraciones), 1)
+    npal = max(len(palabras), 1)
+    nsil = sum(_silabas_es(p) for p in palabras)
+    P = nsil / npal
+    F = npal / no
+    fh = max(0.0, min(100.0, 206.84 - (60 * P) - (1.02 * F)))
+    nivel = (
+        "Muy fácil" if fh >= 80 else "Fácil" if fh >= 70 else
+        "Bastante fácil" if fh >= 60 else "Normal" if fh >= 50 else
+        "Algo difícil" if fh >= 40 else "Difícil" if fh >= 30 else
+        "Muy difícil"
+    )
+    significativas = [p.lower() for p in palabras
+                      if len(p) > 3 and p.lower() not in _STOPWORDS]
+    repetidas = [(p, c) for p, c in Counter(significativas).most_common(8)
+                 if c >= 3]
+    diversidad = (len(set(p.lower() for p in palabras)) / npal) * 100
+    largas = [o for o in oraciones if len(o.split()) > 30]
+
+    consejos: list[str] = []
+    if F > 25:
+        consejos.append(
+            f"Las oraciones son largas (promedio {F:.0f} palabras). "
+            "Divide las más extensas para mejorar la lectura."
+        )
+    if fh < 50:
+        consejos.append(
+            "La legibilidad es baja. Usa palabras y oraciones más sencillas."
+        )
+    if diversidad < 45:
+        consejos.append(
+            f"Diversidad de vocabulario baja ({diversidad:.0f}%). "
+            "Apóyate en sinónimos."
+        )
+    if repetidas:
+        top = ", ".join(f"«{p}» ({c})" for p, c in repetidas[:3])
+        consejos.append(f"Palabras muy repetidas: {top}.")
+    if largas:
+        consejos.append(
+            f"{len(largas)} oración(es) supera(n) las 30 palabras."
+        )
+    if not consejos:
+        consejos.append(
+            "¡Bien hecho! El texto tiene buena legibilidad y variedad léxica."
+        )
+    return {
+        "fh": fh, "nivel": nivel, "F": F, "P": P,
+        "diversidad": diversidad, "n_palabras": npal,
+        "n_oraciones": no, "repetidas": repetidas,
+        "oraciones_largas": len(largas), "consejos": consejos,
+    }
+
+
+def clasificar_referencia(linea: str) -> str:
+    t = linea.strip(); tl = t.lower()
+    if not t:
+        return "Otro"
+    if re.search(r"\btesis\b|\bdisertaci[oó]n\b|tesis doctoral|trabajo de grado", tl):
+        return "Tesis"
+    if re.search(r"\b(actas|conferencia|congreso|simposio|proceedings)\b", tl):
+        return "Conferencia"
+    if re.search(r"\b(informe|reporte|report)\b", tl) and "doi" not in tl:
+        return "Informe"
+    if re.search(r"\bdoi\.org\/|https?:\/\/doi\.org|\bdoi:\s*10\.", tl):
+        return "Artículo de revista"
+    if re.search(r",\s*\d{1,4}\s*\(\s*\d+\s*\)\s*,\s*\d+", t):
+        return "Artículo de revista"
+    if re.search(r"\ben\s+[A-ZÁÉÍÓÚÑ][^()]+\(eds?\.|\(ed\.\)|\(coords?\.|\(comps?\.", t):
+        return "Capítulo de libro"
+    if re.search(r"https?:\/\/", tl):
+        return "Recurso web"
+    if re.search(r"\b(ediciones|editorial|press|publishers?|paid[oó]s|fce|"
+                 r"siglo xxi|mcgraw|pearson|alianza|gedisa|anagrama)\b", tl):
+        return "Libro"
+    return "Otro"
+
+
+def estadisticas_referencias(referencias: str) -> dict:
+    lineas = [l.strip() for l in (referencias or "").splitlines() if l.strip()]
+    por_tipo: dict = {}
+    por_anio: dict = {}
+    sin_anio = 0
+    for l in lineas:
+        por_tipo[clasificar_referencia(l)] = por_tipo.get(
+            clasificar_referencia(l), 0) + 1
+        m = re.search(r"\((\d{4})[a-z]?\)", l)
+        anio = int(m.group(1)) if m and 1500 <= int(m.group(1)) <= 2100 else None
+        if anio is None:
+            sin_anio += 1
+        else:
+            por_anio[anio] = por_anio.get(anio, 0) + 1
+    return {
+        "total": len(lineas), "por_tipo": por_tipo,
+        "por_anio": por_anio, "sin_anio": sin_anio,
+    }
+
+
+# ---------------------------- Word -------------------------------------------
+
+
+def _aplicar_fuente(run, *, size_pt=12, bold=False, color=None):
+    run.font.name = "Times New Roman"
+    rPr = run._element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = rPr.makeelement(qn("w:rFonts"), {})
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rFonts.set(qn(attr), "Times New Roman")
+    run.font.size = Pt(size_pt)
+    run.bold = bold
+    if color is not None:
+        run.font.color.rgb = color
+
+
+def _add_parrafo(doc, texto, *, sangria=True, francesa=False, size_pt=12,
+                 bold=False, color=None, alineacion=None):
+    p = doc.add_paragraph()
+    if alineacion is not None:
+        p.alignment = alineacion
+    pf = p.paragraph_format
+    if francesa:
+        pf.left_indent = Cm(1.27); pf.first_line_indent = Cm(-1.27)
+    elif sangria:
+        pf.first_line_indent = Cm(1.27)
+    pf.line_spacing_rule = WD_LINE_SPACING.DOUBLE
+    pf.space_after = Pt(0); pf.space_before = Pt(0)
+    run = p.add_run(texto)
+    _aplicar_fuente(run, size_pt=size_pt, bold=bold, color=color)
+    return p
+
+
+def construir_docx(secciones: dict) -> bytes:
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(12)
+    rPr = normal.element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = rPr.makeelement(qn("w:rFonts"), {})
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rFonts.set(qn(attr), "Times New Roman")
+
+    for section in doc.sections:
+        section.top_margin = Cm(2.54); section.bottom_margin = Cm(2.54)
+        section.left_margin = Cm(2.54); section.right_margin = Cm(2.54)
+
+    titulo = secciones.get("titulo") or "Documento corregido en APA 7"
+    _add_parrafo(doc, titulo, sangria=False, bold=True, size_pt=14,
+                 color=RGBColor(0x1E, 0x40, 0xAF),
+                 alineacion=WD_ALIGN_PARAGRAPH.CENTER)
+    _add_parrafo(doc, "", sangria=False)
+
+    cuerpo = secciones.get("cuerpo", "").strip()
+    for parrafo in cuerpo.split("\n"):
+        linea = parrafo.strip()
+        if not linea:
+            _add_parrafo(doc, "", sangria=False); continue
+        m = re.match(r"^\[H([123])\]\s*(.+)$", linea)
+        if m:
+            nivel = int(m.group(1)); titulo_h = m.group(2).strip()
+            if nivel == 1:
+                p = _add_parrafo(doc, titulo_h, sangria=False, bold=True,
+                                 size_pt=12,
+                                 alineacion=WD_ALIGN_PARAGRAPH.CENTER)
+            elif nivel == 2:
+                p = _add_parrafo(doc, titulo_h, sangria=False, bold=True,
+                                 size_pt=12,
+                                 alineacion=WD_ALIGN_PARAGRAPH.LEFT)
+            else:
+                p = _add_parrafo(doc, titulo_h, sangria=False, bold=True,
+                                 size_pt=12,
+                                 alineacion=WD_ALIGN_PARAGRAPH.LEFT)
+                for r in p.runs:
+                    r.italic = True
+            # Mantiene el título junto con el siguiente párrafo
+            p.paragraph_format.keep_with_next = True
+            p.paragraph_format.keep_together = True
+            continue
+        _add_parrafo(doc, linea, sangria=True)
+
+    refs = secciones.get("referencias", "").strip()
+    if refs:
+        doc.add_page_break()
+        _add_parrafo(doc, "Referencias", sangria=False, bold=True, size_pt=12,
+                     color=RGBColor(0x1E, 0x40, 0xAF),
+                     alineacion=WD_ALIGN_PARAGRAPH.CENTER)
+        for l in refs.split("\n"):
+            l = l.strip()
+            if l:
+                _add_parrafo(doc, l, sangria=False, francesa=True)
+
+    notas = secciones.get("notas", "").strip()
+    if notas:
+        doc.add_page_break()
+        _add_parrafo(doc, "Notas de cambios", sangria=False, bold=True,
+                     size_pt=12, color=RGBColor(0x1E, 0x40, 0xAF),
+                     alineacion=WD_ALIGN_PARAGRAPH.CENTER)
+        for l in notas.split("\n"):
+            if l.strip():
+                _add_parrafo(doc, l.strip(), sangria=False)
+
+    buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
+
+
+def leer_docx_desde_uri_o_ruta(origen: str) -> str:
+    """Acepta una ruta de archivo o un content:// URI de Android."""
+    if origen.startswith("content://"):
+        datos = leer_uri_android(origen)
+        doc = Document(io.BytesIO(datos))
+        partes = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                partes.append(p.text)
+        return "\n\n".join(partes)
+    return leer_docx(origen)
+
+
+def leer_docx(ruta: str) -> str:
+    doc = Document(ruta)
+    partes = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    for tabla in doc.tables:
+        for fila in tabla.rows:
+            for celda in fila.cells:
+                t = (celda.text or "").strip()
+                if t:
+                    partes.append(t)
+    return "\n\n".join(partes)
+
+
+# ---------------------------- Almacenamiento ---------------------------------
+
+
+def directorio_descargas() -> str:
+    """Carpeta privada de la app (siempre escribible, todas las versiones).
+
+    En Android 11+ la carpeta pública /sdcard/Download/ está bloqueada por
+    scoped storage. Usamos la carpeta privada de la app que SIEMPRE funciona
+    y es visible al usuario via Archivos > Android > data > com.apuapa.apuapa
+    > files > Download. Para guardar en la Descargas pública usamos
+    `guardar_en_downloads_publicos` (Android 10+ vía MediaStore).
+    """
+    if platform == "android":
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Environment = autoclass("android.os.Environment")
+            ctx = PythonActivity.mActivity
+            f = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            if f is not None:
+                ruta = f.getAbsolutePath()
+                os.makedirs(ruta, exist_ok=True)
+                return ruta
+        except Exception:
+            pass
+        try:
+            from android.storage import app_storage_path
+            ruta = os.path.join(app_storage_path(), "Download")
+            os.makedirs(ruta, exist_ok=True)
+            return ruta
+        except Exception:
+            return os.path.expanduser("~")
+    return str(Path.home() / "Downloads")
+
+
+def guardar_en_downloads_publicos(nombre: str, datos: bytes,
+                                  mime: str) -> str | None:
+    """Escribe en la carpeta Descargas PÚBLICA via MediaStore (Android 10+).
+
+    Devuelve la ruta visible al usuario o None si no se pudo (Android < 10
+    o error). En ese caso llamar `directorio_descargas()` como fallback.
+    """
+    if platform != "android":
+        return None
+    try:
+        from jnius import autoclass
+        Build = autoclass("android.os.Build$VERSION")
+        if Build.SDK_INT < 29:  # Android 10 = API 29
+            return None
+        ContentValues = autoclass("android.content.ContentValues")
+        MediaStoreDownloads = autoclass(
+            "android.provider.MediaStore$Downloads"
+        )
+        Environment = autoclass("android.os.Environment")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        ctx = PythonActivity.mActivity
+        resolver = ctx.getContentResolver()
+        values = ContentValues()
+        values.put("_display_name", nombre)
+        values.put("mime_type", mime)
+        values.put(
+            "relative_path",
+            Environment.DIRECTORY_DOWNLOADS + "/APU-APA",
+        )
+        uri = resolver.insert(
+            MediaStoreDownloads.EXTERNAL_CONTENT_URI, values
+        )
+        if uri is None:
+            return None
+        out = resolver.openOutputStream(uri)
+        try:
+            # Convertir bytes Python a byte[] Java
+            out.write(bytes(datos))
+        finally:
+            out.close()
+        return f"Descargas/APU-APA/{nombre}"
+    except Exception:
+        return None
+
+
+def mostrar_toast_android(mensaje: str, largo: bool = True) -> bool:
+    """Muestra un Toast nativo (siempre visible). True si funcionó."""
+    if platform != "android":
+        return False
+    try:
+        from jnius import autoclass
+        Toast = autoclass("android.widget.Toast")
+        String = autoclass("java.lang.String")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        ctx = PythonActivity.mActivity
+        duracion = Toast.LENGTH_LONG if largo else Toast.LENGTH_SHORT
+
+        class _Runnable(autoclass("java.lang.Runnable")):
+            pass
+
+        # Toast.makeText debe correr en el hilo UI de Android
+        from kivy.clock import mainthread as _mt
+
+        @_mt
+        def _show(*_):
+            try:
+                Toast.makeText(ctx, String(mensaje), duracion).show()
+            except Exception:
+                pass
+
+        _show()
+        return True
+    except Exception:
+        return False
+
+
+def leer_uri_android(uri_str: str) -> bytes:
+    """Lee bytes desde un content:// URI usando ContentResolver."""
+    from jnius import autoclass
+    Uri = autoclass("android.net.Uri")
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    resolver = PythonActivity.mActivity.getContentResolver()
+    stream = resolver.openInputStream(Uri.parse(uri_str))
+    if stream is None:
+        raise RuntimeError("No se pudo abrir el archivo seleccionado.")
+    try:
+        buf = bytearray()
+        chunk = bytearray(8192)
+        while True:
+            n = stream.read(chunk)
+            if n is None or n < 0:
+                break
+            buf.extend(bytes(chunk)[:n])
+        return bytes(buf)
+    finally:
+        stream.close()
+
+
+def pedir_permisos_android():
+    if platform != "android":
+        return
+    try:
+        from android.permissions import Permission, request_permissions
+        request_permissions([
+            Permission.INTERNET,
+            Permission.READ_EXTERNAL_STORAGE,
+            Permission.WRITE_EXTERNAL_STORAGE,
+        ])
+    except Exception:
+        pass
+
+
+def detectar_modo_oscuro_sistema() -> str:
+    """Devuelve 'Dark' o 'Light' según el sistema (en Android), si se puede."""
+    if platform == "android":
+        try:
+            from jnius import autoclass
+            Configuration = autoclass("android.content.res.Configuration")
+            PythonActivity = autoclass(
+                "org.kivy.android.PythonActivity"
+            )
+            night_mask = (
+                PythonActivity.mActivity.getResources()
+                .getConfiguration().uiMode
+                & Configuration.UI_MODE_NIGHT_MASK
+            )
+            if night_mask == Configuration.UI_MODE_NIGHT_YES:
+                return "Dark"
+        except Exception:
+            pass
+    return "Light"
+
+
+# ---------------------------- UI ---------------------------------------------
+
+
+# Paleta APU-APA — alineada con la web (verde bosque + marrón tierra + crema)
+PRIMARIO = (45 / 255, 80 / 255, 22 / 255, 1)        # #2D5016 verde bosque
+PRIMARIO_OSCURO = (35 / 255, 60 / 255, 16 / 255, 1) # acento más oscuro
+ACENTO = (139 / 255, 69 / 255, 19 / 255, 1)         # #8B4513 marrón tierra
+CREMA = (250 / 255, 246 / 255, 236 / 255, 1)        # #FAF6EC fondo suave
+CREMA_BORDE = (235 / 255, 225 / 255, 200 / 255, 1)
+TEXTO_OSCURO = (45 / 255, 58 / 255, 31 / 255, 1)    # #2D3A1F
+
+
+def _ruta_logo() -> str:
+    """Devuelve la ruta absoluta al logo si existe, o cadena vacía."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidatos = [
+        os.path.join(here, "assets", "logo.jpeg"),
+        os.path.join(here, "assets", "logo.png"),
+    ]
+    for p in candidatos:
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+LOGO_PATH = _ruta_logo()
+
+
+class Tab(MDFloatLayout, MDTabsBase):
+    """Contenedor para una pestaña en MDTabs."""
+
+
+class HomeScreen(MDScreen):
+    pass
+
+
+class ResultsScreen(MDScreen):
+    pass
+
+
+class CorrectorApp(MDApp):
+    title = "Corrector APA 7"
+
+    def build(self):
+        _marca_arranque("3_build_iniciado")
+        self.theme_cls.primary_palette = "Green"
+        self.theme_cls.accent_palette = "Brown"
+        # Por defecto modo claro (igual que la web). El usuario puede cambiar
+        # con el icono de tema. Guardamos la preferencia en config.
+        self.theme_cls.theme_style = "Light"
+        # NOTA: M3 rompe MDSwitch en KivyMD 1.2.0 (KeyError 'thumb').
+        # Usamos M2 que es estable y visualmente casi igual.
+        self.theme_cls.material_style = "M2"
+        # Fondo crema en toda la app (igual al backgroundColor de la web)
+        Window.clearcolor = CREMA
+        _marca_arranque("3b_tema_ok")
+
+        self.config_path = os.path.join(self.user_data_dir, "config.json")
+        self._cargar_config()
+        # Aplicar tema preferido del usuario si lo guardó antes
+        if self.cfg.get("theme_style") in ("Light", "Dark"):
+            self.theme_cls.theme_style = self.cfg["theme_style"]
+        _marca_arranque("3c_config_ok")
+
+        Window.softinput_mode = "below_target"
+        try:
+            pedir_permisos_android()
+        except Exception as e:
+            _marca_arranque("3d_permisos_fallo", str(e))
+        _marca_arranque("3e_permisos_ok")
+
+        self.sm = MDScreenManager()
+        self.sm.add_widget(self._build_splash())
+        self.sm.add_widget(self._build_home())
+        _marca_arranque("3f_home_ok")
+        self.sm.add_widget(self._build_results())
+        _marca_arranque("4_build_completo")
+        # Iniciar la animación de carga; cuando termine pasa a "home"
+        Clock.schedule_once(lambda *_: self._iniciar_animacion_splash(), 0.1)
+        return self.sm
+
+    # ---- Splash animado ----------------------------------------------------
+
+    def _build_splash(self) -> MDScreen:
+        screen = MDScreen(name="splash", md_bg_color=CREMA)
+        cont = MDBoxLayout(
+            orientation="vertical",
+            padding=(dp(32), dp(60), dp(32), dp(60)),
+            spacing=dp(16),
+        )
+        # Espacio superior flexible
+        cont.add_widget(MDBoxLayout(size_hint_y=0.5))
+        # Logo grande
+        logo = KivyImage(
+            source="assets/logo.png",
+            size_hint=(None, None),
+            size=(dp(200), dp(200)),
+            pos_hint={"center_x": 0.5},
+            allow_stretch=True,
+            keep_ratio=True,
+        )
+        cont.add_widget(logo)
+        # Título APU-APA
+        cont.add_widget(MDLabel(
+            text="APU-APA",
+            halign="center",
+            theme_text_color="Custom", text_color=PRIMARIO,
+            font_style="H3", bold=True,
+            size_hint_y=None, height=dp(60),
+        ))
+        # Subtítulo
+        cont.add_widget(MDLabel(
+            text="Corrector APA 7",
+            halign="center",
+            theme_text_color="Custom", text_color=ACENTO,
+            font_style="Subtitle1",
+            size_hint_y=None, height=dp(28),
+        ))
+        # Espacio medio
+        cont.add_widget(MDBoxLayout(size_hint_y=0.5))
+        # Slogan
+        cont.add_widget(MDLabel(
+            text="Menos tiempo en el formato,\nmás tiempo en el conocimiento.",
+            halign="center",
+            theme_text_color="Custom", text_color=TEXTO_OSCURO,
+            font_style="Subtitle2",
+            size_hint_y=None, height=dp(60),
+        ))
+        # Barra de progreso
+        self._splash_bar = MDProgressBar(
+            value=0, max=100,
+            color=PRIMARIO,
+            size_hint_y=None, height=dp(6),
+        )
+        cont.add_widget(self._splash_bar)
+        # Texto "Cargando..."
+        self._splash_label = MDLabel(
+            text="Cargando…",
+            halign="center",
+            theme_text_color="Custom", text_color=PRIMARIO,
+            font_style="Caption",
+            size_hint_y=None, height=dp(24),
+        )
+        cont.add_widget(self._splash_label)
+        screen.add_widget(cont)
+        return screen
+
+    def _iniciar_animacion_splash(self):
+        """Anima la barra de carga y luego pasa a la pantalla principal."""
+        try:
+            anim = Animation(value=100, duration=2.2, t="in_out_quad")
+            anim.bind(on_complete=lambda *_: self._terminar_splash())
+            anim.start(self._splash_bar)
+            # Cambiar el texto a la mitad del recorrido
+            Clock.schedule_once(
+                lambda *_: setattr(self._splash_label, "text", "Casi listo…"),
+                1.2,
+            )
+        except Exception:
+            # Si algo falla, vamos directo a home
+            self._terminar_splash()
+
+    def _terminar_splash(self):
+        try:
+            self.sm.transition.direction = "left"
+            self.sm.current = "home"
+        except Exception:
+            pass
+
+    # ---- Configuración persistente (API key, modelo, tema) -----------------
+
+    def _cargar_config(self):
+        # API key embebida en el build (inyectada por GitHub Actions desde
+        # el secret GEMINI_API_KEY) — el usuario no necesita configurar nada
+        clave_default = ""
+        try:
+            from _default_key import DEFAULT_API_KEY as clave_default  # noqa
+        except Exception:
+            clave_default = os.environ.get("GEMINI_API_KEY", "")
+        self.cfg = {
+            "api_key": clave_default,
+            "modelo": GEMINI_DEFAULT,
+            "theme_style": "Light",
+        }
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    self.cfg.update(json.load(f))
+        except Exception:
+            pass
+        # Si la config guardada no tiene key (instalación previa), forzar la
+        # default embebida — prioriza siempre tener la app funcionando.
+        if not self.cfg.get("api_key") and clave_default:
+            self.cfg["api_key"] = clave_default
+
+    def _guardar_config(self):
+        try:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f)
+        except Exception:
+            pass
+
+    # ---- Home --------------------------------------------------------------
+
+    def _build_home(self) -> HomeScreen:
+        screen = HomeScreen(name="home")
+        root = MDBoxLayout(orientation="vertical")
+
+        # Toolbar minimalista (solo iconos de acción)
+        toolbar = MDTopAppBar(
+            title="",
+            elevation=0,
+            md_bg_color=PRIMARIO,
+            specific_text_color=(1, 1, 1, 1),
+            right_action_items=[
+                ["theme-light-dark", lambda x: self._toggle_tema()],
+                ["cog-outline", lambda x: self._abrir_ajustes()],
+            ],
+        )
+        root.add_widget(toolbar)
+
+        scroll = MDScrollView()
+        body = MDBoxLayout(
+            orientation="vertical", padding=dp(16), spacing=dp(18),
+            adaptive_height=True, size_hint_y=None,
+        )
+        body.bind(minimum_height=body.setter("height"))
+
+        # ---- Hero header con logo + título grande ----
+        body.add_widget(self._hero_header())
+
+        # ---- Acordeones expandibles (como la web) ----
+        body.add_widget(self._collapsible(
+            titulo="¿Cómo usar APU-APA? (guía rápida)",
+            color=PRIMARIO,
+            icono="book-open-page-variant",
+            build=self._contenido_guia,
+        ))
+        body.add_widget(self._collapsible(
+            titulo="Ejemplos de citas y referencias APA 7",
+            color=ACENTO,
+            icono="format-quote-close",
+            build=self._contenido_ejemplos,
+        ))
+        body.add_widget(self._collapsible(
+            titulo="Plantillas APA en blanco (Word)",
+            color=PRIMARIO,
+            icono="file-document-multiple-outline",
+            build=self._contenido_plantillas,
+        ))
+
+        # ---- Card "Subir documento" estilo web (cream + borde verde) ----
+        body.add_widget(self._tarjeta_accion(
+            icono="file-upload",
+            titulo="Subir documento Word",
+            subtitulo="Lee el .docx y carga el texto automáticamente",
+            color_borde=PRIMARIO,
+            on_press=self._elegir_docx,
+        ))
+
+        # ---- Tipo de documento ----
+        body.add_widget(MDLabel(
+            text="Tipo de documento",
+            theme_text_color="Custom", text_color=PRIMARIO,
+            font_style="Subtitle2", bold=True,
+            size_hint_y=None, height=dp(22),
+        ))
+        self.tipo_btn = MDRaisedButton(
+            text="Ensayo / Trabajo académico",
+            icon="chevron-down",
+            md_bg_color=PRIMARIO, size_hint_x=1,
+            elevation=2,
+            on_release=lambda *_: self._abrir_menu_tipo(),
+        )
+        body.add_widget(self.tipo_btn)
+        self.tipo_doc = "ensayo o trabajo académico"
+
+        # ---- Caja de texto ----
+        body.add_widget(MDLabel(
+            text="Tu texto",
+            theme_text_color="Custom", text_color=PRIMARIO,
+            font_style="Subtitle2", bold=True,
+            size_hint_y=None, height=dp(22),
+        ))
+        self.input_text = MDTextField(
+            hint_text="Pega aquí tu ensayo, tesis o artículo…",
+            multiline=True,
+            mode="rectangle",
+            size_hint_y=None, height=dp(220),
+            line_color_focus=PRIMARIO,
+        )
+        self.input_text.bind(text=self._actualizar_contador)
+        body.add_widget(self.input_text)
+
+        # Contador de palabras con icono (igual que la web "0 palabras")
+        contador_row = MDBoxLayout(
+            orientation="horizontal", spacing=dp(2),
+            size_hint_y=None, height=dp(28),
+        )
+        contador_row.add_widget(MDIcon(
+            icon="pencil-outline",
+            theme_text_color="Custom", text_color=ACENTO,
+            font_size=dp(16),
+            size_hint=(None, None), size=(dp(20), dp(20)),
+            halign="center", valign="middle",
+        ))
+        self.contador_label = MDLabel(
+            text="0 palabras",
+            theme_text_color="Custom",
+            text_color=ACENTO,
+            font_style="Caption",
+        )
+        contador_row.add_widget(self.contador_label)
+        body.add_widget(contador_row)
+
+        # ---- Switch notas (estilo card cream) ----
+        notas_card = MDCard(
+            orientation="horizontal",
+            padding=(dp(14), dp(8), dp(14), dp(8)),
+            spacing=dp(12),
+            size_hint_y=None, height=dp(60),
+            md_bg_color=CREMA,
+            line_color=CREMA_BORDE,
+            radius=[dp(10)] * 4, elevation=0,
+        )
+        self.switch_notas = MDSwitch(active=True)
+        notas_card.add_widget(self.switch_notas)
+        notas_card.add_widget(MDLabel(
+            text="Incluir notas de cambios en el Word",
+            theme_text_color="Custom",
+            text_color=TEXTO_OSCURO,
+            font_style="Body2",
+        ))
+        body.add_widget(notas_card)
+
+        # ---- Botón corregir (CTA grande) ----
+        self.btn_corregir = MDRaisedButton(
+            text="Corregir formato APA 7",
+            icon="auto-fix",
+            md_bg_color=PRIMARIO, size_hint_x=1,
+            font_size=dp(17),
+            elevation=4,
+            on_release=lambda *_: self._iniciar_correccion(),
+        )
+        # Forzar altura mayor para el CTA principal
+        self.btn_corregir.height = dp(54)
+        body.add_widget(self.btn_corregir)
+
+        # ---- Barra de progreso ----
+        self.progress = MDProgressBar(
+            value=0, size_hint_y=None, height=dp(6), opacity=0,
+            color=PRIMARIO,
+        )
+        body.add_widget(self.progress)
+        self.estado = MDLabel(
+            text="", theme_text_color="Secondary",
+            size_hint_y=None, height=dp(24), halign="center",
+        )
+        body.add_widget(self.estado)
+
+        scroll.add_widget(body)
+        root.add_widget(scroll)
+        screen.add_widget(root)
+        return screen
+
+    def _hero_header(self) -> MDCard:
+        """Card grande con logo + título + subtítulo, igual que la web."""
+        card = MDCard(
+            orientation="horizontal",
+            padding=(dp(16), dp(16), dp(16), dp(16)),
+            spacing=dp(14),
+            size_hint_y=None, height=dp(120),
+            md_bg_color=PRIMARIO,
+            radius=[dp(16)] * 4, elevation=4,
+        )
+        if LOGO_PATH:
+            card.add_widget(KivyImage(
+                source=LOGO_PATH,
+                size_hint=(None, None),
+                size=(dp(72), dp(72)),
+                allow_stretch=True, keep_ratio=True,
+            ))
+        col = MDBoxLayout(orientation="vertical", spacing=dp(2))
+        col.add_widget(MDLabel(
+            text="APU-APA",
+            theme_text_color="Custom", text_color=(1, 1, 1, 1),
+            font_style="H4", bold=True,
+            size_hint_y=None, height=dp(40),
+        ))
+        col.add_widget(MDLabel(
+            text="Corrector APA 7ma · Citas, referencias y formato",
+            theme_text_color="Custom", text_color=(1, 1, 1, 0.92),
+            font_style="Caption",
+            size_hint_y=None, height=dp(18),
+        ))
+        col.add_widget(MDLabel(
+            text="Pega tu texto o sube un Word/PDF.",
+            theme_text_color="Custom", text_color=(1, 1, 1, 0.78),
+            font_style="Caption",
+            size_hint_y=None, height=dp(18),
+        ))
+        card.add_widget(col)
+        return card
+
+    def _tarjeta_accion(self, icono, titulo, subtitulo, on_press,
+                        color_borde=None):
+        if color_borde is None:
+            color_borde = PRIMARIO
+        card = MDCard(
+            orientation="horizontal",
+            padding=(dp(16), dp(14), dp(16), dp(14)),
+            spacing=dp(14),
+            size_hint_y=None, height=dp(96), ripple_behavior=True,
+            elevation=1, radius=[dp(12)] * 4,
+            md_bg_color=CREMA,
+            line_color=color_borde,
+        )
+        card.bind(on_release=lambda *_: on_press())
+        # MDIcon (no MDIconButton) para no bloquear los toques de la card
+        card.add_widget(MDIcon(
+            icon=icono, theme_text_color="Custom",
+            text_color=color_borde, font_size=dp(36),
+            size_hint=(None, None), size=(dp(48), dp(48)),
+            halign="center", valign="middle",
+        ))
+        col = MDBoxLayout(orientation="vertical", spacing=dp(2))
+        col.add_widget(MDLabel(
+            text=titulo, font_style="H6", bold=True,
+            theme_text_color="Custom", text_color=color_borde,
+        ))
+        col.add_widget(MDLabel(
+            text=subtitulo,
+            theme_text_color="Custom",
+            text_color=TEXTO_OSCURO,
+            font_style="Caption",
+        ))
+        card.add_widget(col)
+        return card
+
+    # ---- Acordeones inline (estilo web) -----------------------------------
+
+    def _collapsible(self, titulo: str, color, build, icono="folder-outline"):
+        """Card colapsable: header con icono + chevron + contenido."""
+        container = MDBoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            adaptive_height=True,
+            spacing=dp(2),
+        )
+        # Header (clickeable)
+        header = MDCard(
+            orientation="horizontal",
+            padding=(dp(8), dp(8), dp(8), dp(8)),
+            spacing=dp(4),
+            size_hint_y=None,
+            height=dp(54),
+            md_bg_color=CREMA,
+            line_color=color,
+            radius=[dp(10)] * 4,
+            elevation=0,
+            ripple_behavior=True,
+        )
+        # Icono temático a la izquierda (MDIcon = label, NO bloquea toques)
+        header.add_widget(MDIcon(
+            icon=icono,
+            theme_text_color="Custom",
+            text_color=color,
+            font_size=dp(26),
+            size_hint=(None, None),
+            size=(dp(34), dp(34)),
+            halign="center", valign="middle",
+        ))
+        header.add_widget(MDLabel(
+            text=titulo,
+            theme_text_color="Custom",
+            text_color=color,
+            font_style="Subtitle1",
+            bold=True,
+        ))
+        # Chevron a la derecha (MDIcon, no bloquea toques)
+        chevron = MDIcon(
+            icon="chevron-right",
+            theme_text_color="Custom",
+            text_color=color,
+            font_size=dp(26),
+            size_hint=(None, None),
+            size=(dp(30), dp(30)),
+            halign="center", valign="middle",
+        )
+        header.add_widget(chevron)
+        container.add_widget(header)
+
+        # Contenido construido perezosamente la primera vez que se abre
+        state = {"abierto": False, "contenido": None}
+
+        def toggle(*_):
+            state["abierto"] = not state["abierto"]
+            if state["abierto"]:
+                chevron.icon = "chevron-down"
+                if state["contenido"] is None:
+                    state["contenido"] = build(color)
+                if state["contenido"] not in container.children:
+                    container.add_widget(state["contenido"])
+            else:
+                chevron.icon = "chevron-right"
+                if state["contenido"] is not None and \
+                        state["contenido"] in container.children:
+                    container.remove_widget(state["contenido"])
+
+        header.bind(on_release=lambda *_: toggle())
+        return container
+
+    def _contenido_guia(self, _color):
+        """3 pasos como en la web (con números ① ② ③ que SÍ renderizan)."""
+        cont = MDBoxLayout(
+            orientation="vertical",
+            spacing=dp(8),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=(dp(4), dp(8), dp(4), dp(8)),
+        )
+        pasos = [
+            ("①",
+             "Ingresa tu texto",
+             "Pega tu ensayo en el cuadro o sube un archivo Word (.docx) "
+             "para extraerlo automáticamente.",
+             PRIMARIO),
+            ("②",
+             "Configura opciones",
+             "Pulsa el engranaje arriba para tu API key, modelo de IA "
+             "(Gemini) y tipo de documento.",
+             ACENTO),
+            ("③",
+             "Corrige y descarga",
+             "Pulsa 'Corregir formato APA 7' y descarga el Word ya "
+             "formateado.",
+             PRIMARIO),
+        ]
+        for numero, titulo, sub, color in pasos:
+            sub_card = MDCard(
+                orientation="horizontal",
+                padding=(dp(10), dp(10), dp(10), dp(10)),
+                spacing=dp(10),
+                size_hint_y=None,
+                adaptive_height=True,
+                md_bg_color=CREMA,
+                line_color=color,
+                radius=[dp(8)] * 4,
+                elevation=0,
+            )
+            sub_card.add_widget(MDLabel(
+                text=numero,
+                theme_text_color="Custom", text_color=color,
+                font_style="H4", bold=True,
+                size_hint_x=None, width=dp(36), halign="center",
+            ))
+            col = MDBoxLayout(orientation="vertical", spacing=dp(2),
+                              adaptive_height=True)
+            col.add_widget(MDLabel(
+                text=titulo,
+                theme_text_color="Custom", text_color=color,
+                font_style="Subtitle2", bold=True,
+                size_hint_y=None, height=dp(24),
+            ))
+            descripcion = MDLabel(
+                text=sub,
+                theme_text_color="Custom", text_color=TEXTO_OSCURO,
+                font_style="Caption",
+                size_hint_y=None,
+            )
+            descripcion.bind(
+                texture_size=lambda i, v: setattr(i, "height", v[1] + dp(4)))
+            col.add_widget(descripcion)
+            sub_card.add_widget(col)
+            cont.add_widget(sub_card)
+        return cont
+
+    def _contenido_ejemplos(self, _color):
+        """Lista inline de ejemplos APA con iconos visuales."""
+        cont = MDBoxLayout(
+            orientation="vertical",
+            spacing=dp(8),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=(dp(4), dp(8), dp(4), dp(8)),
+        )
+        ejemplos = [
+            ("Libro", "book", PRIMARIO,
+             "Apellido, A. (Año). Título del libro (Edición). Editorial."),
+            ("Artículo de revista", "newspaper-variant-outline", ACENTO,
+             "Apellido, A. (Año). Título del artículo. Revista, "
+             "vol(núm), pp–pp. https://doi.org/..."),
+            ("Página web", "web", PRIMARIO,
+             "Apellido, A. (Año, día de mes). Título de la página. "
+             "Nombre del sitio web. URL"),
+            ("Cita en el texto", "format-quote-close", ACENTO,
+             "Paréntesis: (Apellido, año, p. X)\n"
+             "Narrativa: Apellido (año) afirma que…"),
+        ]
+        for titulo, icono, color, ejemplo in ejemplos:
+            card = MDCard(
+                orientation="vertical",
+                padding=(dp(10), dp(8), dp(10), dp(10)),
+                spacing=dp(4),
+                size_hint_y=None,
+                adaptive_height=True,
+                md_bg_color=CREMA,
+                line_color=color,
+                radius=[dp(8)] * 4, elevation=0,
+            )
+            # Header del card: icono + título lado a lado
+            head_row = MDBoxLayout(
+                orientation="horizontal",
+                spacing=dp(6),
+                size_hint_y=None, height=dp(34),
+            )
+            head_row.add_widget(MDIcon(
+                icon=icono,
+                theme_text_color="Custom", text_color=color,
+                font_size=dp(22),
+                size_hint=(None, None), size=(dp(28), dp(28)),
+                halign="center", valign="middle",
+            ))
+            head_row.add_widget(MDLabel(
+                text=titulo,
+                theme_text_color="Custom", text_color=color,
+                font_style="Subtitle2", bold=True,
+            ))
+            card.add_widget(head_row)
+            # Texto del ejemplo
+            lbl = MDLabel(
+                text=ejemplo,
+                theme_text_color="Custom", text_color=TEXTO_OSCURO,
+                font_style="Caption",
+                size_hint_y=None,
+                padding=(dp(4), 0),
+            )
+            lbl.bind(
+                texture_size=lambda i, v: setattr(i, "height", v[1] + dp(6)))
+            card.add_widget(lbl)
+            cont.add_widget(card)
+        return cont
+
+    def _contenido_plantillas(self, _color):
+        """Lista inline de plantillas APA descargables."""
+        cont = MDBoxLayout(
+            orientation="vertical",
+            spacing=dp(10),
+            size_hint_y=None,
+            adaptive_height=True,
+            padding=(dp(4), dp(8), dp(4), dp(8)),
+        )
+        info = MDLabel(
+            text="Toca cualquier plantilla para descargarla en formato Word "
+                 "(se guardará en Descargas):",
+            theme_text_color="Custom", text_color=TEXTO_OSCURO,
+            font_style="Caption",
+            size_hint_y=None,
+        )
+        info.bind(texture_size=lambda i, v: setattr(i, "height", v[1] + dp(4)))
+        cont.add_widget(info)
+
+        # Iconos por tipo de plantilla
+        iconos_plantilla = {
+            "Ensayo": "file-document-edit-outline",
+            "Artículo de investigación": "newspaper-variant-outline",
+            "Informe de investigación": "file-chart-outline",
+            "Tesis / Monografía": "school-outline",
+            "Reseña crítica": "comment-text-outline",
+            "Proyecto de investigación": "lightbulb-on-outline",
+        }
+        for nombre, datos in PLANTILLAS_APA.items():
+            icono = iconos_plantilla.get(nombre, "file-download-outline")
+            fila = MDBoxLayout(
+                orientation="vertical",
+                spacing=dp(4),
+                size_hint_y=None,
+                adaptive_height=True,
+                padding=(0, dp(2), 0, dp(2)),
+            )
+            # Fila botón con icono + texto + flecha descarga
+            btn_row = MDBoxLayout(
+                orientation="horizontal",
+                spacing=dp(0),
+                size_hint_y=None, height=dp(50),
+            )
+            btn = MDRaisedButton(
+                text=nombre,
+                icon=icono,
+                md_bg_color=PRIMARIO,
+                text_color=(1, 1, 1, 1),
+                theme_text_color="Custom",
+                size_hint_x=1,
+                size_hint_y=None,
+                height=dp(46),
+            )
+            btn.bind(on_release=lambda _w, n=nombre:
+                     self._descargar_plantilla(n))
+            btn_row.add_widget(btn)
+            fila.add_widget(btn_row)
+            desc = MDLabel(
+                text=datos.get("descripcion", ""),
+                theme_text_color="Custom", text_color=TEXTO_OSCURO,
+                font_style="Caption",
+                size_hint_y=None,
+                padding=(dp(8), 0),
+            )
+            desc.bind(
+                texture_size=lambda i, v: setattr(i, "height", v[1] + dp(4)))
+            fila.add_widget(desc)
+            cont.add_widget(fila)
+        return cont
+
+    def _actualizar_contador(self, _instance, valor):
+        n = len([w for w in (valor or "").split() if w.strip()])
+        self.contador_label.text = f"{n} palabras"
+
+    def _descargar_plantilla(self, nombre: str):
+        """Genera la plantilla y la guarda en Descargas con confirmación."""
+        try:
+            data = construir_plantilla_apa(nombre)
+            slug = re.sub(r"[^\w\-]+", "_", nombre.lower())
+            archivo = f"plantilla_apa_{slug}.docx"
+            mime = (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            )
+            # Intento 1: Descargas pública (Android 10+ via MediaStore)
+            visible = guardar_en_downloads_publicos(archivo, data, mime)
+            if visible:
+                self._dialogo_exito(
+                    "Plantilla descargada",
+                    f"'{nombre}' se guardó en:\n{visible}\n\n"
+                    "Ábrela desde tu app de Archivos."
+                )
+                return
+            # Fallback: carpeta privada de la app
+            destino = directorio_descargas()
+            ruta = os.path.join(destino, archivo)
+            i = 1
+            while os.path.exists(ruta):
+                ruta = os.path.join(
+                    destino, f"plantilla_apa_{slug}_{i}.docx"
+                )
+                i += 1
+            with open(ruta, "wb") as f:
+                f.write(data)
+            self._dialogo_exito(
+                "Plantilla descargada",
+                f"'{nombre}' se guardó en:\n{ruta}"
+            )
+        except Exception as e:
+            try:
+                _marca_arranque("plantilla_error", f"{nombre}: {e}")
+            except Exception:
+                pass
+            self._snack(f"Error al crear plantilla: {type(e).__name__}: {e}")
+
+    def _abrir_menu_tipo(self):
+        opciones = [
+            "ensayo o trabajo académico",
+            "artículo de investigación",
+            "tesis o tesina",
+            "informe / reporte",
+            "monografía",
+        ]
+        items = [
+            {
+                "text": op.capitalize(),
+                "viewclass": "OneLineListItem",
+                "on_release": lambda x=op: self._set_tipo(x),
+            }
+            for op in opciones
+        ]
+        self._menu_tipo = MDDropdownMenu(
+            caller=self.tipo_btn, items=items, width_mult=4,
+        )
+        self._menu_tipo.open()
+
+    def _set_tipo(self, t):
+        self.tipo_doc = t
+        self.tipo_btn.text = f"Tipo: {t.capitalize()}"
+        if hasattr(self, "_menu_tipo"):
+            self._menu_tipo.dismiss()
+
+    def _toggle_tema(self):
+        nuevo = "Dark" if self.theme_cls.theme_style == "Light" else "Light"
+        self.theme_cls.theme_style = nuevo
+        Window.clearcolor = (
+            CREMA if nuevo == "Light" else (0.10, 0.12, 0.10, 1)
+        )
+        self.cfg["theme_style"] = nuevo
+        self._guardar_config()
+
+    def _abrir_ajustes(self):
+        contenido = MDBoxLayout(
+            orientation="vertical", spacing=dp(12),
+            size_hint_y=None, height=dp(80), padding=dp(8),
+        )
+        modelo_field = MDTextField(
+            hint_text="Modelo (gemini-2.0-flash, gemini-1.5-pro, …)",
+            text=self.cfg.get("modelo", GEMINI_DEFAULT),
+        )
+        contenido.add_widget(modelo_field)
+
+        def guardar(*_):
+            self.cfg["modelo"] = modelo_field.text.strip() or GEMINI_DEFAULT
+            self._guardar_config()
+            dialog.dismiss()
+            self._snack("Ajustes guardados.")
+
+        dialog = MDDialog(
+            title="Ajustes",
+            type="custom",
+            content_cls=contenido,
+            buttons=[
+                MDFlatButton(text="Cancelar",
+                             on_release=lambda *_: dialog.dismiss()),
+                MDFlatButton(text="Guardar",
+                             theme_text_color="Custom",
+                             text_color=PRIMARIO,
+                             on_release=guardar),
+            ],
+        )
+        dialog.open()
+
+    # ---- File picker -------------------------------------------------------
+
+    def _elegir_docx(self):
+        """Abre el selector de archivos NATIVO de Android (SAF).
+
+        Usa Intent.ACTION_OPEN_DOCUMENT que funciona en Android 5+.
+        Mucho más fiable que plyer.filechooser (que falla en muchas marcas).
+        """
+        if platform == "android":
+            try:
+                self._abrir_picker_saf()
+                return
+            except Exception as e:
+                self._snack(
+                    f"No se pudo abrir el explorador nativo: {e}. "
+                    "Intentando método alternativo…"
+                )
+        # Fallback (escritorio o si SAF falla)
+        try:
+            from plyer import filechooser
+            filechooser.open_file(
+                title="Selecciona un archivo .docx",
+                filters=[("Word", "*.docx")],
+                on_selection=self._on_archivo_seleccionado,
+            )
+        except Exception as e:
+            self._snack(f"No se pudo abrir el explorador: {e}")
+
+    def _abrir_picker_saf(self):
+        """Lanza Intent.ACTION_OPEN_DOCUMENT y espera el resultado."""
+        from jnius import autoclass
+        from android import activity  # noqa: registra la callback nativa
+
+        Intent = autoclass("android.content.Intent")
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        StringClass = autoclass("java.lang.String")
+
+        intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.setType("*/*")
+        # Filtrar por tipos Word (.docx y .doc)
+        mime_array = [
+            StringClass(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            StringClass("application/msword"),
+        ]
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, mime_array)
+
+        # Registrar callback ANTES de lanzar el intent
+        REQ_CODE = 5571
+
+        def _on_result(request_code, result_code, data):
+            try:
+                if request_code != REQ_CODE:
+                    return
+                # RESULT_OK = -1 ; RESULT_CANCELED = 0
+                if result_code != -1 or data is None:
+                    return
+                uri = data.getData()
+                if uri is None:
+                    return
+                self._on_archivo_seleccionado([uri.toString()])
+            except Exception as e:
+                self._snack(f"Error procesando archivo: {e}")
+            finally:
+                # Desuscribir para no acumular callbacks
+                try:
+                    activity.unbind(on_activity_result=_on_result)
+                except Exception:
+                    pass
+
+        activity.bind(on_activity_result=_on_result)
+        PythonActivity.mActivity.startActivityForResult(intent, REQ_CODE)
+
+    @mainthread
+    def _on_archivo_seleccionado(self, seleccion):
+        if not seleccion:
+            return
+        origen = seleccion[0]
+        try:
+            texto = leer_docx_desde_uri_o_ruta(origen)
+            if not texto.strip():
+                self._dialogo_exito(
+                    "Documento vacío",
+                    "El archivo seleccionado no contiene texto."
+                )
+                return
+            self.input_text.text = texto
+            n_palabras = len(texto.split())
+            self._dialogo_exito(
+                "Documento cargado",
+                f"Se extrajeron {n_palabras} palabras del archivo. "
+                "Ahora puedes presionar 'Corregir con IA'."
+            )
+        except Exception as e:
+            self._snack(f"No se pudo leer el .docx: {e}")
+
+    # ---- Procesamiento -----------------------------------------------------
+
+    def _iniciar_correccion(self):
+        texto = (self.input_text.text or "").strip()
+        if not texto:
+            self._snack("Pega texto o sube un .docx primero.")
+            return
+        if not self.cfg.get("api_key"):
+            self._snack(
+                "La app no se compiló con clave de Gemini. "
+                "Avisa al desarrollador."
+            )
+            return
+
+        self.btn_corregir.disabled = True
+        self.progress.opacity = 1
+        self.progress.value = 10
+        self.estado.text = "Conectando con Gemini…"
+        self._anim_progress()
+
+        self._texto_original = texto
+
+        hilo = threading.Thread(
+            target=self._worker_correccion, args=(texto,), daemon=True,
+        )
+        hilo.start()
+
+    def _anim_progress(self):
+        def step(_dt):
+            if self.progress.opacity == 0:
+                return False
+            v = self.progress.value
+            if v < 90:
+                self.progress.value = min(90, v + 4)
+                return True
+            return True
+        Clock.schedule_interval(step, 0.4)
+
+    def _worker_correccion(self, texto):
+        try:
+            salida = llamar_gemini_rest(
+                api_key=self.cfg["api_key"],
+                texto=texto,
+                tipo_doc=self.tipo_doc,
+                modelo=self.cfg.get("modelo", GEMINI_DEFAULT),
+                con_notas=bool(self.switch_notas.active),
+            )
+            secciones = parsear_secciones(salida)
+            self._on_correccion_ok(secciones)
+        except Exception as e:
+            self._on_correccion_error(str(e))
+
+    @mainthread
+    def _on_correccion_ok(self, secciones):
+        self.progress.value = 100
+        self.estado.text = "Corrección completada."
+        self.btn_corregir.disabled = False
+        self.progress.opacity = 0
+        self._secciones = secciones
+        self._mostrar_resultados()
+
+    @mainthread
+    def _on_correccion_error(self, mensaje):
+        self.progress.opacity = 0
+        self.btn_corregir.disabled = False
+        self.estado.text = ""
+        self._snack(mensaje)
+
+    # ---- Resultados --------------------------------------------------------
+
+    def _build_results(self) -> ResultsScreen:
+        screen = ResultsScreen(name="results")
+        root = MDBoxLayout(orientation="vertical")
+
+        toolbar = MDTopAppBar(
+            title="Resultado APA 7",
+            elevation=2,
+            md_bg_color=PRIMARIO,
+            specific_text_color=(1, 1, 1, 1),
+            left_action_items=[
+                ["arrow-left", lambda x: self._volver_home()],
+            ],
+            right_action_items=[
+                ["download", lambda x: self._descargar_word()],
+                ["theme-light-dark", lambda x: self._toggle_tema()],
+            ],
+        )
+        root.add_widget(toolbar)
+
+        self.tabs = MDTabs(
+            background_color=PRIMARIO,
+            text_color_active=(1, 1, 1, 1),
+            text_color_normal=(1, 1, 1, 0.6),
+            indicator_color=(1, 1, 1, 1),
+        )
+        self.tab_cuerpo = Tab(title="Cuerpo")
+        self.tab_refs = Tab(title="Referencias")
+        self.tab_stats = Tab(title="Estadísticas")
+        self.tab_tips = Tab(title="Tips")
+        for t in (self.tab_cuerpo, self.tab_refs, self.tab_stats, self.tab_tips):
+            self.tabs.add_widget(t)
+        root.add_widget(self.tabs)
+        screen.add_widget(root)
+        return screen
+
+    def _mostrar_resultados(self):
+        for tab in (self.tab_cuerpo, self.tab_refs, self.tab_stats,
+                    self.tab_tips):
+            tab.clear_widgets()
+
+        s = self._secciones
+
+        # CUERPO
+        self.tab_cuerpo.add_widget(
+            self._scroll_texto(self._formatear_cuerpo_markup(
+                s.get("titulo", ""), s.get("cuerpo", "")
+            ), markup=True)
+        )
+
+        # REFERENCIAS
+        refs = s.get("referencias", "").strip()
+        if refs:
+            txt = "\n\n".join(f"• {l.strip()}" for l in refs.split("\n")
+                              if l.strip())
+        else:
+            txt = "No se generaron referencias."
+        self.tab_refs.add_widget(self._scroll_texto(txt))
+
+        # ESTADÍSTICAS
+        self.tab_stats.add_widget(self._build_stats_view(s))
+
+        # TIPS
+        self.tab_tips.add_widget(self._build_tips_view(s))
+
+        self.sm.current = "results"
+
+    def _formatear_cuerpo_markup(self, titulo, cuerpo):
+        partes = []
+        if titulo:
+            partes.append(
+                f"[size=22sp][b][color=2D5016]{titulo}[/color][/b][/size]\n"
+            )
+        for linea in (cuerpo or "").split("\n"):
+            l = linea.strip()
+            if not l:
+                partes.append(""); continue
+            m = re.match(r"^\[H([123])\]\s*(.+)$", l)
+            if m:
+                nivel = int(m.group(1)); txt = m.group(2)
+                if nivel == 1:
+                    partes.append(f"\n[size=20sp][b]{txt}[/b][/size]\n")
+                elif nivel == 2:
+                    partes.append(f"\n[size=18sp][b]{txt}[/b][/size]\n")
+                else:
+                    partes.append(f"\n[size=16sp][b][i]{txt}[/i][/b][/size]\n")
+            else:
+                partes.append(l)
+        return "\n".join(partes)
+
+    def _scroll_texto(self, texto, markup=False):
+        scroll = MDScrollView()
+        lbl = MDLabel(
+            text=texto or "—",
+            markup=markup,
+            size_hint_y=None,
+            padding=(dp(16), dp(16)),
+            halign="left",
+        )
+        lbl.bind(
+            width=lambda *_: setattr(lbl, "text_size",
+                                     (lbl.width - dp(32), None)),
+            texture_size=lambda *_: setattr(lbl, "height",
+                                            lbl.texture_size[1] + dp(32)),
+        )
+        scroll.add_widget(lbl)
+        return scroll
+
+    def _build_stats_view(self, secciones):
+        scroll = MDScrollView()
+        box = MDBoxLayout(
+            orientation="vertical", padding=dp(16), spacing=dp(10),
+            adaptive_height=True, size_hint_y=None,
+        )
+        box.bind(minimum_height=box.setter("height"))
+
+        original = getattr(self, "_texto_original", "")
+        cuerpo = secciones.get("cuerpo", "")
+        refs = secciones.get("referencias", "")
+        cambios = contar_cambios_palabras(original, cuerpo)
+        citas_o = contar_citas(original); citas_c = contar_citas(cuerpo)
+        n_refs = contar_referencias(refs)
+
+        box.add_widget(MDLabel(
+            text="[b]Métricas de la corrección[/b]",
+            markup=True, font_style="H6",
+            size_hint_y=None, height=dp(28),
+        ))
+        for label, valor in [
+            ("Citas en el texto", f"{citas_c} (Δ {citas_c - citas_o:+d})"),
+            ("Referencias generadas", str(n_refs)),
+            ("Palabras corregidas", str(cambios["total"])),
+            ("Modificadas / añadidas / eliminadas",
+             f"{cambios['modificadas']} / {cambios['anadidas']} / "
+             f"{cambios['eliminadas']}"),
+            ("Palabras totales",
+             f"{cambios['palabras_corregido']} "
+             f"({cambios['palabras_corregido'] - cambios['palabras_original']:+d})"),
+        ]:
+            box.add_widget(self._fila_metrica(label, valor))
+
+        # Distribución por tipo de fuente
+        stats = estadisticas_referencias(refs)
+        box.add_widget(MDLabel(
+            text="[b]Distribución de fuentes[/b]",
+            markup=True, font_style="H6",
+            size_hint_y=None, height=dp(34),
+        ))
+        if stats["total"] == 0:
+            box.add_widget(MDLabel(
+                text="No hay referencias para analizar.",
+                theme_text_color="Secondary",
+                size_hint_y=None, height=dp(24),
+            ))
+        else:
+            max_v = max(stats["por_tipo"].values())
+            for tipo, n in sorted(stats["por_tipo"].items(),
+                                  key=lambda x: -x[1]):
+                box.add_widget(self._barra_tipo(
+                    tipo, n, max_v, stats["total"]))
+
+        scroll.add_widget(box)
+        return scroll
+
+    def _fila_metrica(self, etiqueta, valor):
+        row = MDBoxLayout(
+            orientation="horizontal", size_hint_y=None, height=dp(32),
+        )
+        row.add_widget(MDLabel(text=etiqueta, theme_text_color="Secondary"))
+        row.add_widget(MDLabel(
+            text=valor, halign="right", bold=True,
+        ))
+        return row
+
+    def _barra_tipo(self, tipo, n, max_v, total):
+        cont = MDBoxLayout(
+            orientation="vertical", size_hint_y=None, height=dp(48),
+            spacing=dp(2),
+        )
+        head = MDBoxLayout(
+            orientation="horizontal", size_hint_y=None, height=dp(20),
+        )
+        head.add_widget(MDLabel(text=tipo))
+        head.add_widget(MDLabel(
+            text=f"{n}  ({round(100 * n / total)}%)", halign="right",
+        ))
+        cont.add_widget(head)
+        bar = MDProgressBar(
+            value=int(100 * n / max(max_v, 1)),
+            size_hint_y=None, height=dp(8),
+            color=PRIMARIO,
+        )
+        cont.add_widget(bar)
+        return cont
+
+    def _build_tips_view(self, secciones):
+        scroll = MDScrollView()
+        box = MDBoxLayout(
+            orientation="vertical", padding=dp(16), spacing=dp(8),
+            adaptive_height=True, size_hint_y=None,
+        )
+        box.bind(minimum_height=box.setter("height"))
+
+        a = analizar_legibilidad(secciones.get("cuerpo", "")
+                                 or getattr(self, "_texto_original", ""))
+        box.add_widget(MDLabel(
+            text="[b]Análisis de redacción[/b]",
+            markup=True, font_style="H6",
+            size_hint_y=None, height=dp(34),
+        ))
+        for label, valor in [
+            ("Legibilidad (Fernández-Huerta)",
+             f"{a['fh']:.0f}/100  ·  {a['nivel']}"),
+            ("Promedio de palabras por oración", f"{a['F']:.1f}"),
+            ("Diversidad léxica", f"{a['diversidad']:.0f}%"),
+            ("Oraciones largas (>30 palabras)", str(a["oraciones_largas"])),
+        ]:
+            box.add_widget(self._fila_metrica(label, valor))
+
+        box.add_widget(MDLabel(
+            text="[b]Sugerencias[/b]",
+            markup=True, font_style="H6",
+            size_hint_y=None, height=dp(34),
+        ))
+        for c in a["consejos"]:
+            box.add_widget(MDLabel(
+                text=f"• {c}",
+                size_hint_y=None,
+            ))
+            # auto-altura por etiqueta
+            box.children[0].bind(
+                width=lambda lbl, w: setattr(
+                    lbl, "text_size", (w - dp(32), None)),
+                texture_size=lambda lbl, ts: setattr(
+                    lbl, "height", ts[1] + dp(8)),
+            )
+        scroll.add_widget(box)
+        return scroll
+
+    def _volver_home(self):
+        self.sm.current = "home"
+
+    # ---- Descarga Word -----------------------------------------------------
+
+    def _descargar_word(self):
+        try:
+            data = construir_docx(self._secciones)
+            base = (self._secciones.get("titulo") or "documento_apa")
+            nombre_base = (
+                re.sub(r"[^\w\-]+", "_", base.strip())[:60]
+                or "documento_apa"
+            )
+            nombre = f"{nombre_base}.docx"
+            mime = (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            )
+            visible = guardar_en_downloads_publicos(nombre, data, mime)
+            if visible:
+                self._dialogo_exito(
+                    "Documento descargado",
+                    f"Tu corrección APA 7 se guardó en:\n{visible}\n\n"
+                    "Ábrela desde tu app de Archivos."
+                )
+                return
+            destino = directorio_descargas()
+            ruta = os.path.join(destino, nombre)
+            i = 1
+            while os.path.exists(ruta):
+                ruta = os.path.join(destino, f"{nombre_base}_{i}.docx")
+                i += 1
+            with open(ruta, "wb") as f:
+                f.write(data)
+            self._dialogo_exito(
+                "Documento descargado",
+                f"Tu corrección APA 7 se guardó en:\n{ruta}"
+            )
+        except Exception as e:
+            self._snack(f"No se pudo guardar el .docx: {e}")
+
+    # ---- Util --------------------------------------------------------------
+
+    def _snack(self, mensaje):
+        """Muestra un mensaje breve. Toast nativo en Android, Snackbar en PC."""
+        if mostrar_toast_android(mensaje):
+            return
+        try:
+            Snackbar(text=mensaje, duration=3).open()
+        except Exception:
+            print(mensaje)
+
+    def _dialogo_exito(self, titulo: str, mensaje: str):
+        """Diálogo modal verde de éxito (siempre visible, fiel a la web)."""
+        dlg = MDDialog(
+            title=titulo,
+            text=mensaje,
+            radius=[dp(14)] * 4,
+            buttons=[
+                MDFlatButton(
+                    text="Aceptar",
+                    theme_text_color="Custom",
+                    text_color=PRIMARIO,
+                    on_release=lambda *_: dlg.dismiss(),
+                ),
+            ],
+        )
+        dlg.open()
+        # Toast adicional para feedback inmediato
+        mostrar_toast_android(mensaje)
+
+
+if __name__ == "__main__":
+    try:
+        CorrectorApp().run()
+    except Exception:
+        _escribir_crash(*sys.exc_info())
+        raise
